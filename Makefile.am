@@ -85,22 +85,10 @@ EXTRA_DIST = \
 	MAINTAINERS.rst \
 	README.rst \
 	NOTICE \
-	.cirrus.yml \
-	.ci/ci.sh \
-	.ci/linux-build.sh \
-	.ci/linux-util.sh \
-	.ci/ovn_upgrade_test.py \
-	.ci/ovn_upgrade_utils.py \
-	.ci/osx-build.sh \
-	.ci/osx-prepare.sh \
-	.ci/ovn-kubernetes/prepare.sh \
-	.ci/ovn-kubernetes/custom.patch \
-	.github/workflows/containers.yml \
-	.github/workflows/test.yml \
-	.github/workflows/ovn-kubernetes.yml \
-	.github/workflows/ovn-fake-multinode-tests.yml \
-	.github/workflows/ovn-upgrade-tests.yml \
-	.readthedocs.yaml \
+	bench/README.md \
+	bench/compare-check-perf.py \
+	bench/profile-hmap-200x200.sh \
+	bench/run-check-perf-200x200.sh \
 	boot.sh \
 	$(MAN_FRAGMENTS) \
 	$(MAN_ROOTS) \
@@ -172,7 +160,9 @@ noinst_HEADERS += $(EXTRA_DIST)
 
 ro_c = echo '/* -*- mode: c; buffer-read-only: t -*- */'
 ro_shell = printf '\043 Generated automatically -- do not modify!    -*- buffer-read-only: t -*-\n'
-submodules = $(shell grep 'path =' $(srcdir)/.gitmodules | sed -E 's/[\t ]*path =\s*(.*)/\1/g' | xargs)
+# OVS is vendored into this experiment repository.  Keep the top-level OVN
+# source checks out of it; OVS has its own checks with its own exclusions.
+submodules = ^ovs/
 
 SUFFIXES += .in
 .in:
@@ -292,8 +282,10 @@ printf-check:
 # Check that certain data structures are always declared "static".
 ALL_LOCAL += static-check
 static-check:
-	@if test -e $(srcdir)/.git && (git --version) >/dev/null 2>&1 && \
-	  git --no-pager grep -n -E '^[ 	]+(struct vlog_rate_limit|pthread_once_t|struct ovsthread_once).*=' $(srcdir); \
+	@cd $(srcdir); \
+	if test -e .git && (git --version) >/dev/null 2>&1 && \
+	  git --no-pager grep -n -E '^[ 	]+(struct vlog_rate_limit|pthread_once_t|struct ovsthread_once).*=' | \
+	  $(EGREP) -v '$(submodules)'; \
 	then \
 	  echo "See above for list of violations of the rule that "; \
 	  echo "certain data structures must always be 'static'"; \
@@ -306,7 +298,7 @@ ALL_LOCAL += check-assert-h-usage
 check-assert-h-usage:
 	@if test -e $(srcdir)/.git && (git --version) >/dev/null 2>&1 && \
 	  (cd $(srcdir) && git --no-pager grep -l -E '[<]assert.h[>]') | \
-	  $(EGREP) -v '^tests/'; \
+	  $(EGREP) -v '$(submodules)|^tests/'; \
 	then \
 	  echo "Files listed above unexpectedly #include <""assert.h"">."; \
 	  echo "Please use ovs_assert (from util.h) instead of assert."; \
@@ -322,7 +314,8 @@ ALL_LOCAL += check-endian
 check-endian:
 	@if test -e $(srcdir)/.git && (git --version) >/dev/null 2>&1 && \
 	  (cd $(srcdir) && git --no-pager grep -l -E \
-	   -e 'BIG_ENDIAN|LITTLE_ENDIAN' --and --not -e 'BYTE_ORDER'); \
+	   -e 'BIG_ENDIAN|LITTLE_ENDIAN' --and --not -e 'BYTE_ORDER') | \
+	  $(EGREP) -v '$(submodules)'; \
 	then \
 	  echo "See above for list of files that misuse LITTLE""_ENDIAN"; \
 	  echo "or BIG""_ENDIAN.  Please use WORDS_BIGENDIAN instead."; \
@@ -333,7 +326,8 @@ check-endian:
 ALL_LOCAL += check-echo-n
 check-echo-n:
 	@if test -e $(srcdir)/.git && (git --version) >/dev/null 2>&1 && \
-	  git --no-pager grep -n 'echo'' -n' $(srcdir); \
+	  (cd $(srcdir) && git --no-pager grep -n 'echo'' -n') | \
+	  $(EGREP) -v '$(submodules)'; \
 	then \
 	  echo "See above for uses for \"echo"" -n\", which is non-POSIX"; \
 	  echo "and does not work with all shells.  Use \"printf\" instead."; \

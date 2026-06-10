@@ -96,4 +96,5 @@ testsuite.tmp.orig
 /Documentation/_build
 /.venv
 /cxx-check
+/results/
 /*.ovsschema.stamp
