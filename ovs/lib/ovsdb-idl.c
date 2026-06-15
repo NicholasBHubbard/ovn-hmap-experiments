@@ -291,7 +291,7 @@ ovsdb_idl_create_unconnected(const struct ovsdb_idl_class *class,
 
             shash_add_assert(&table->columns, column->name, column);
         }
-        hmap_init(&table->rows);
+        swtab_init(&table->rows);
         ovs_list_init(&table->track_list);
         table->change_seqno[OVSDB_IDL_CHANGE_INSERT]
             = table->change_seqno[OVSDB_IDL_CHANGE_MODIFY]
@@ -373,7 +373,7 @@ ovsdb_idl_destroy(struct ovsdb_idl *idl)
             ovsdb_idl_schema_columns_clear(&table->schema_columns);
             shash_destroy(&table->schema_columns);
 
-            hmap_destroy(&table->rows);
+            swtab_destroy(&table->rows);
             free(table->modes);
         }
         shash_destroy(&idl->table_by_name);
@@ -414,13 +414,13 @@ ovsdb_idl_clear(struct ovsdb_idl *db)
      */
     for (size_t i = 0; i < db->class_->n_tables; i++) {
         struct ovsdb_idl_table *table = &db->tables[i];
-        struct ovsdb_idl_row *row;
+        struct ovsdb_idl_row *row, *next;
 
-        if (hmap_is_empty(&table->rows)) {
+        if (swtab_is_empty(&table->rows)) {
             continue;
         }
 
-        HMAP_FOR_EACH_SAFE (row, hmap_node, &table->rows) {
+        SWTAB_FOR_EACH_SAFE (row, next, row_node, &table->rows) {
             struct ovsdb_idl_arc *arc;
 
             if (!ovsdb_idl_row_is_orphan(row)) {
@@ -518,7 +518,7 @@ ovsdb_idl_get_memory_usage(struct ovsdb_idl *idl, struct simap *usage)
     for (size_t i = 0; i < idl->class_->n_tables; i++) {
         struct ovsdb_idl_table *table = &idl->tables[i];
         unsigned int n_columns = table->class_->n_columns;
-        unsigned int n_rows = hmap_count(&table->rows);
+        unsigned int n_rows = swtab_count(&table->rows);
 
         cells += n_rows * n_columns;
     }
@@ -738,7 +738,7 @@ ovsdb_idl_check_consistency(const struct ovsdb_idl *idl)
         const struct ovsdb_idl_table_class *class = table->class_;
 
         const struct ovsdb_idl_row *row;
-        HMAP_FOR_EACH (row, hmap_node, &table->rows) {
+        SWTAB_FOR_EACH (row, row_node, &table->rows) {
             size_t n_dsts = 0;
             if (row->new_datum) {
                 size_t n_columns = shash_count(&row->table->columns);
@@ -1446,7 +1446,7 @@ ovsdb_idl_track_clear__(struct ovsdb_idl *idl, bool flush_all)
                     }
 
                     /* Rows that were reused as orphan after being processed
-                     * for deletion are still in the table hmap and will be
+                     * for deletion are still in the table and will be
                      * cleaned up when their src arcs are removed.  These rows
                      * will not be reported anymore as "deleted" to IDL
                      * clients.
@@ -1640,7 +1640,7 @@ ovsdb_idl_get_row(struct ovsdb_idl_table *table, const struct uuid *uuid)
 {
     struct ovsdb_idl_row *row;
 
-    HMAP_FOR_EACH_WITH_HASH (row, hmap_node, uuid_hash(uuid), &table->rows) {
+    SWTAB_FOR_EACH_WITH_HASH (row, row_node, uuid_hash(uuid), &table->rows) {
         if (uuid_equals(&row->uuid, uuid)) {
             return row;
         }
@@ -2369,7 +2369,7 @@ static struct ovsdb_idl_row *
 ovsdb_idl_row_create(struct ovsdb_idl_table *table, const struct uuid *uuid)
 {
     struct ovsdb_idl_row *row = ovsdb_idl_row_create__(table->class_);
-    hmap_insert(&table->rows, &row->hmap_node, uuid_hash(uuid));
+    swtab_insert(&table->rows, &row->row_node, uuid_hash(uuid));
     row->uuid = *uuid;
     row->table = table;
     row->map_op_written = NULL;
@@ -2379,7 +2379,7 @@ ovsdb_idl_row_create(struct ovsdb_idl_table *table, const struct uuid *uuid)
     return row;
 }
 
-/* If 'row' is not referenced anymore, removes 'row' from the table hmap,
+/* If 'row' is not referenced anymore, removes 'row' from the table,
  * clears the old datum and adds 'row' to the table's track_list.
  *
  * If 'row' is still referenced, i.e., became "orphan", queues 'row' for
@@ -2391,7 +2391,7 @@ ovsdb_idl_row_destroy(struct ovsdb_idl_row *row)
 {
     ovsdb_idl_row_clear_old(row);
     if (ovs_list_is_empty(&row->dst_arcs)) {
-        hmap_remove(&row->table->rows, &row->hmap_node);
+        swtab_remove(&row->table->rows, &row->row_node);
         ovsdb_idl_destroy_all_map_op_lists(row);
         ovsdb_idl_destroy_all_set_op_lists(row);
         ovsdb_idl_row_track_change(row, OVSDB_IDL_CHANGE_DELETE);
@@ -2609,12 +2609,12 @@ ovsdb_idl_get_row_for_uuid(const struct ovsdb_idl *idl,
 }
 
 static struct ovsdb_idl_row *
-next_real_row(struct ovsdb_idl_table *table, struct hmap_node *node)
+next_real_row(struct ovsdb_idl_table *table, struct swtab_node *node)
 {
-    for (; node; node = hmap_next(&table->rows, node)) {
+    for (; node; node = swtab_next(&table->rows, node)) {
         struct ovsdb_idl_row *row;
 
-        row = CONTAINER_OF(node, struct ovsdb_idl_row, hmap_node);
+        row = CONTAINER_OF(node, struct ovsdb_idl_row, row_node);
         if (ovsdb_idl_row_exists(row)) {
             return row;
         }
@@ -2634,7 +2634,7 @@ ovsdb_idl_first_row(const struct ovsdb_idl *idl,
 {
     struct ovsdb_idl_table *table = ovsdb_idl_table_from_class(idl,
                                                                table_class);
-    return next_real_row(table, hmap_first(&table->rows));
+    return next_real_row(table, swtab_first(&table->rows));
 }
 
 /* Returns a row following 'row' within its table, or a null pointer if 'row'
@@ -2644,7 +2644,7 @@ ovsdb_idl_next_row(const struct ovsdb_idl_row *row)
 {
     struct ovsdb_idl_table *table = row->table;
 
-    return next_real_row(table, hmap_next(&table->rows, &row->hmap_node));
+    return next_real_row(table, swtab_next(&table->rows, &row->row_node));
 }
 
 /* Reads and returns the value of 'column' within 'row'.  If an ongoing
@@ -3001,7 +3001,7 @@ ovsdb_idl_txn_disassemble(struct ovsdb_idl_txn *txn)
         if (op != INSERTED) {
             ovsdb_idl_add_to_indexes(row);
         } else {
-            hmap_remove(&row->table->rows, &row->hmap_node);
+            swtab_remove(&row->table->rows, &row->row_node);
             free(row);
         }
     }
@@ -3316,7 +3316,7 @@ ovsdb_idl_txn_commit(struct ovsdb_idl_txn *txn)
              * have one row. */
             size_t initial_rows = 0;
             size_t final_rows = 0;
-            HMAP_FOR_EACH (row, hmap_node, &table->rows) {
+            SWTAB_FOR_EACH (row, row_node, &table->rows) {
                 initial_rows += row->old_datum != NULL;
                 final_rows += row->new_datum != NULL;
             }
@@ -3861,7 +3861,7 @@ ovsdb_idl_txn_delete(const struct ovsdb_idl_row *row_)
         ovsdb_idl_destroy_all_set_op_lists(row);
         ovsdb_idl_row_clear_new(row);
         ovs_assert(!row->prereqs);
-        hmap_remove(&row->table->rows, &row->hmap_node);
+        swtab_remove(&row->table->rows, &row->row_node);
         hmap_remove(&row->table->idl->txn->txn_rows, &row->txn_node);
         free(row);
         return;
@@ -3893,7 +3893,7 @@ ovsdb_idl_txn_insert__(struct ovsdb_idl_txn *txn,
     row->persist_uuid = persist_uuid;
     row->table = ovsdb_idl_table_from_class(txn->idl, class);
     row->new_datum = xmalloc(class->n_columns * sizeof *row->new_datum);
-    hmap_insert(&row->table->rows, &row->hmap_node, uuid_hash(&row->uuid));
+    swtab_insert(&row->table->rows, &row->row_node, uuid_hash(&row->uuid));
     hmap_insert(&txn->txn_rows, &row->txn_node, uuid_hash(&row->uuid));
     ovsdb_idl_add_to_indexes(row);
 

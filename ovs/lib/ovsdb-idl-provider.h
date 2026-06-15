@@ -24,6 +24,7 @@
 #include "ovsdb-set-op.h"
 #include "ovsdb-types.h"
 #include "openvswitch/shash.h"
+#include "openvswitch/swtab.h"
 #include "sset.h"
 #include "uuid.h"
 
@@ -68,7 +69,7 @@ extern "C" {
  *       the current transaction.
  */
 struct ovsdb_idl_row {
-    struct hmap_node hmap_node; /* In struct ovsdb_idl_table's 'rows'. */
+    struct swtab_node row_node; /* In struct ovsdb_idl_table's 'rows'. */
     struct uuid uuid;           /* Row "_uuid" field. */
     struct ovs_list src_arcs;   /* Forward arcs (ovsdb_idl_arc.src_node). */
     struct ovs_list dst_arcs;   /* Backward arcs (ovsdb_idl_arc.dst_node). */
@@ -123,7 +124,7 @@ struct ovsdb_idl_table {
     struct shash columns;    /* Contains "const struct ovsdb_idl_column *"s. */
     struct shash schema_columns; /* Contains "const struct ovsdb_type *" per
                                   * column as defined in the server schema. */
-    struct hmap rows;        /* Contains "struct ovsdb_idl_row"s. */
+    struct swtab rows;       /* Contains "struct ovsdb_idl_row"s. */
     struct ovsdb_idl *idl;   /* Containing IDL instance. */
     unsigned int change_seqno[OVSDB_IDL_CHANGE_MAX];
     bool in_server_schema;   /* Indicates if this table is in the server schema
