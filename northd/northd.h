@@ -300,7 +300,6 @@ enum ovn_lflow_table_search_mode {
     LFLOW_TABLE_SEARCH_FIELDS,
     LFLOW_TABLE_SEARCH_SBUUID,
 };
-extern thread_local size_t thread_lflow_counter;
 
 /*
  * Multicast snooping and querier per datapath configuration.

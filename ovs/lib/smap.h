@@ -74,23 +74,50 @@ struct smap_node {
  *
  * The 'KEY', 'K1', 'K2' arguments are evaluated multiple times.
  */
-#define SMAP_CONST1(SMAP, KEY, VALUE) (const struct smap) { \
-            HMAP_CONST(&(SMAP)->map, 1, SMAP_NODE(KEY, VALUE, NULL)) \
-        }
-#define SMAP_CONST2(SMAP, K1, V1, K2, V2) (const struct smap) {     \
-            HMAP_CONST(&(SMAP)->map, 2,                             \
-                       SMAP_NODE(K1, V1, SMAP_NODE(K2, V2, NULL)))  \
-        }
-#define SMAP_NODE(KEY, VALUE, NEXT)             \
-        &(struct smap_node) {                   \
-            .node = {                           \
-                .hash = hash_string(KEY, 0),    \
-                .next = (NEXT),                 \
-            },                                  \
-            .key = CONST_CAST(char *, KEY),     \
-            .value = CONST_CAST(char *, VALUE), \
-        }.node
-
+#define SMAP_CONST1(SMAP, KEY, VALUE) (const struct smap) {            \
+        { {                                                            \
+            (int8_t *)(void *)(size_t []) { 0 },                       \
+            (void **)(void *)(dshmap__small_node []) {                 \
+                { hash_string(KEY, 0), SMAP_NODE(KEY, VALUE),          \
+                  DSHMAP__SMALL_END }                                  \
+            },                                                         \
+            NULL, hmap_dshmap_hash, 1, 0, DSHMAP__SMALL_END, true      \
+        } }                                                            \
+    }
+#define SMAP_CONST2(SMAP, K1, V1, K2, V2) (const struct smap) {        \
+        { {                                                            \
+            (int8_t *)(void *)(size_t []) {                            \
+                SMAP_CONST2_BUCKET(K1, K2, 0),                         \
+                SMAP_CONST2_BUCKET(K1, K2, 1)                          \
+            },                                                         \
+            (void **)(void *)(dshmap__small_node []) {                 \
+                { hash_string(K1, 0), SMAP_NODE(K1, V1),               \
+                  SMAP_CONST2_NEXT(K1, K2) },                          \
+                { hash_string(K2, 0), SMAP_NODE(K2, V2),               \
+                  DSHMAP__SMALL_END }                                  \
+            },                                                         \
+            NULL, hmap_dshmap_hash, 2, 1, DSHMAP__SMALL_END, true      \
+        } }                                                            \
+    }
+#define SMAP_CONST2_BUCKET(K1, K2, BUCKET)                 \
+    (((hash_string(K1, 0) & 1) == (BUCKET))                \
+     ? 0                                                   \
+     : (((hash_string(K2, 0) & 1) == (BUCKET))             \
+        ? 1                                                \
+        : DSHMAP__SMALL_END))
+#define SMAP_CONST2_NEXT(K1, K2)                           \
+    (((hash_string(K1, 0) & 1) == (hash_string(K2, 0) & 1)) \
+     ? 1                                                   \
+     : DSHMAP__SMALL_END)
+#define SMAP_NODE(KEY, VALUE)                              \
+    &(struct smap_node) {                                  \
+        .node = {                                          \
+            .hash = hash_string(KEY, 0),                   \
+            .next = NULL,                                  \
+        },                                                 \
+        .key = CONST_CAST(char *, KEY),                    \
+        .value = CONST_CAST(char *, VALUE),                \
+    }.node
 
 void smap_init(struct smap *);
 void smap_destroy(struct smap *);

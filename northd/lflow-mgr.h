@@ -17,6 +17,7 @@
 #define LFLOW_MGR_H 1
 
 #include "include/openvswitch/hmap.h"
+#include "include/openvswitch/thread.h"
 #include "include/openvswitch/uuid.h"
 
 #include "northd.h"
@@ -30,6 +31,10 @@ struct ovn_lflow;
 struct lflow_table {
     struct hmap entries; /* hmap of lflows. */
     struct hmap dp_groups[DP_MAX];
+    struct hmap *parallel_entries;
+    struct ovs_mutex *parallel_locks;
+    size_t parallel_mask;
+    bool parallel_active;
     ssize_t max_seen_lflow_size;
 };
 
@@ -38,7 +43,8 @@ void lflow_table_init(struct lflow_table *);
 void lflow_table_clear(struct lflow_table *, bool);
 void lflow_table_destroy(struct lflow_table *);
 void lflow_table_expand(struct lflow_table *);
-void lflow_table_set_size(struct lflow_table *, size_t);
+void lflow_table_prepare_parallel(struct lflow_table *, size_t);
+void lflow_table_finish_parallel(struct lflow_table *);
 void lflow_table_sync_to_sb(struct lflow_table *,
                             struct ovsdb_idl_txn *ovnsb_txn,
                             const struct ovn_synced_datapaths dps[DP_MAX],
@@ -46,9 +52,6 @@ void lflow_table_sync_to_sb(struct lflow_table *,
                             const struct sbrec_logical_flow_table *,
                             const struct sbrec_logical_dp_group_table *);
 void lflow_table_destroy(struct lflow_table *);
-
-void lflow_hash_lock_init(void);
-void lflow_hash_lock_destroy(void);
 
 /* lflow mgr manages logical flows for a resource (like logical port
  * or datapath). */

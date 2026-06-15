@@ -25,6 +25,7 @@
 #include "hash.h"
 #include "ovstest.h"
 #include "random.h"
+#include "smap.h"
 #include "util.h"
 
 /* Sample hmap element. */
@@ -127,7 +128,7 @@ print_hmap(const char *name, struct hmap *hmap)
 
     printf("%s:", name);
     HMAP_FOR_EACH (e, node, hmap) {
-        printf(" %d(%"PRIuSIZE")", e->value, e->node.hash & hmap->mask);
+        printf(" %d(%"PRIuSIZE")", e->value, hmap_node_hash(&e->node));
     }
     printf("\n");
 }
@@ -188,6 +189,43 @@ test_hmap_insert_delete(hash_func *hash)
         check_hmap(&hmap, values + (i + 1), N_ELEMS - (i + 1), hash);
     }
     hmap_destroy(&hmap);
+}
+
+static void
+check_hmap_insert_fast_over_capacity(hash_func *hash, size_t reserve)
+{
+    struct element *elements;
+    int *values;
+    struct hmap hmap;
+    size_t capacity;
+    size_t n;
+    size_t i;
+
+    hmap_init(&hmap);
+    hmap_reserve(&hmap, reserve);
+
+    capacity = hmap_capacity(&hmap);
+    n = capacity + 1;
+    elements = xmalloc(n * sizeof *elements);
+    values = xmalloc(n * sizeof *values);
+
+    for (i = 0; i < n; i++) {
+        elements[i].value = i;
+        hmap_insert_fast(&hmap, &elements[i].node, hash(i));
+        values[i] = i;
+        check_hmap(&hmap, values, i + 1, hash);
+    }
+
+    hmap_destroy(&hmap);
+    free(values);
+    free(elements);
+}
+
+static void
+test_hmap_insert_fast(hash_func *hash)
+{
+    check_hmap_insert_fast_over_capacity(hash, 0);
+    check_hmap_insert_fast_over_capacity(hash, 1);
 }
 
 /* Tests basic hmap_reserve() and hmap_shrink(). */
@@ -356,6 +394,37 @@ test_hmap_for_each_pop(hash_func *hash)
 }
 
 static void
+test_smap_const(void)
+{
+    const struct smap smap1 = SMAP_CONST1(&smap1, "key1", "value1");
+    const struct smap smap2 = SMAP_CONST2(&smap2, "key1", "value1",
+                                          "key2", "value2");
+    const struct smap *maps[] = { &smap1, &smap2 };
+    const size_t counts[] = { 1, 2 };
+    const char *keys[] = { "key1", "key2" };
+    const char *values[] = { "value1", "value2" };
+    size_t i;
+
+    for (i = 0; i < ARRAY_SIZE(maps); i++) {
+        const struct smap *smap = maps[i];
+        const struct smap_node *node;
+        size_t n = 0;
+        size_t j;
+
+        assert(smap_count(smap) == counts[i]);
+        assert(!smap_is_empty(smap));
+        for (j = 0; j < counts[i]; j++) {
+            assert(!strcmp(smap_get(smap, keys[j]), values[j]));
+        }
+
+        SMAP_FOR_EACH (node, smap) {
+            n++;
+        }
+        assert(n == counts[i]);
+    }
+}
+
+static void
 run_test(void (*function)(hash_func *))
 {
     hash_func *hash_funcs[] = { identity_hash, good_hash, constant_hash };
@@ -372,9 +441,12 @@ static void
 test_hmap_main(int argc OVS_UNUSED, char *argv[] OVS_UNUSED)
 {
     run_test(test_hmap_insert_delete);
+    run_test(test_hmap_insert_fast);
     run_test(test_hmap_for_each_safe);
     run_test(test_hmap_reserve_shrink);
     run_test(test_hmap_for_each_pop);
+    test_smap_const();
+    printf(".");
     printf("\n");
 }
 
