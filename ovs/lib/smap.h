@@ -18,6 +18,7 @@
 #include <sys/types.h>
 #include <netinet/in.h>
 #include "hash.h"
+#include "openvswitch/util.h"
 #include "openvswitch/hmap.h"
 
 #ifdef __cplusplus
@@ -74,23 +75,53 @@ struct smap_node {
  *
  * The 'KEY', 'K1', 'K2' arguments are evaluated multiple times.
  */
-#define SMAP_CONST1(SMAP, KEY, VALUE) (const struct smap) { \
-            HMAP_CONST(&(SMAP)->map, 1, SMAP_NODE(KEY, VALUE, NULL)) \
-        }
-#define SMAP_CONST2(SMAP, K1, V1, K2, V2) (const struct smap) {     \
-            HMAP_CONST(&(SMAP)->map, 2,                             \
-                       SMAP_NODE(K1, V1, SMAP_NODE(K2, V2, NULL)))  \
-        }
-#define SMAP_NODE(KEY, VALUE, NEXT)             \
-        &(struct smap_node) {                   \
-            .node = {                           \
-                .hash = hash_string(KEY, 0),    \
-                .next = (NEXT),                 \
-            },                                  \
-            .key = CONST_CAST(char *, KEY),     \
-            .value = CONST_CAST(char *, VALUE), \
-        }.node
 
+#define SMAP_NODE(KEY, VALUE, IDX) \
+            (&(struct smap_node) {                   \
+                .node = {                           \
+                    .hash = hash_string(KEY, 0),    \
+                    .index = IDX, \
+                },                                  \
+                .key = CONST_CAST(char *, KEY),     \
+                .value = CONST_CAST(char *, VALUE), \
+            }.node)
+
+#define HASH_BYTE(KEY) \
+        0xFF & (hash_string(KEY, 0) >> 24) \
+
+#define HMAP_INIT_MAP(SMAP, N, BF, HASHES, NODES) { \
+            .buckets = CONST_CAST(struct bucket *, &(&(SMAP)->map)->one), \
+            .one = { \
+                .bitfield = BF, \
+                .hash_byte = { HASHES }, \
+                .nodes = { NODES }, \
+            }, \
+            .mask = 0, \
+            .n = N, \
+}
+
+#define HMAP_INIT1(SMAP, KEY, VALUE) \
+        HMAP_INIT_MAP(SMAP, 1, 1, \
+        HASH_BYTE(KEY), \
+        SMAP_NODE(KEY, VALUE, 0)) \
+
+#define TWO_ARGS_TO_ONE(...) __VA_ARGS__
+
+#define HMAP_INIT2(SMAP, K1, V1, K2, V2) \
+        HMAP_INIT_MAP(SMAP, 2, 3, \
+        TWO_ARGS_TO_ONE( HASH_BYTE(K1), HASH_BYTE(K2) ), \
+        TWO_ARGS_TO_ONE( SMAP_NODE(K1, V1, 0), SMAP_NODE(K2, V2, 1) ) )
+
+#define HMAP_INIT(SMAP, ...) \
+    GET_SAFE_MACRO4(__VA_ARGS__, HMAP_INIT2, 0, HMAP_INIT1)(SMAP, __VA_ARGS__)
+
+#define SMAP_CONST1(SMAP, KEY, VALUE) (const struct smap) { \
+        .map = HMAP_INIT(SMAP, KEY, VALUE) \
+}
+
+#define SMAP_CONST2(SMAP, K1, V1, K2, V2) (const struct smap) {     \
+        .map = HMAP_INIT(SMAP, K1, V1, K2, V2) \
+}
 
 void smap_init(struct smap *);
 void smap_destroy(struct smap *);
