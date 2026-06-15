@@ -35,12 +35,71 @@ struct element {
 
 typedef size_t hash_func(int value);
 
+static size_t macro_hmap_calls;
+static size_t macro_shard_calls;
+static size_t macro_shard_count_calls;
+
 static int
 compare_ints(const void *a_, const void *b_)
 {
     const int *a = a_;
     const int *b = b_;
     return *a < *b ? -1 : *a > *b;
+}
+
+static void
+check_hmap_positions(struct hmap *hmap, const int values[], size_t n)
+{
+    struct hmap_position pos = { 0, 0 };
+    int *sort_values, *position_values;
+    struct hmap_node *node;
+    size_t i;
+
+    sort_values = xmalloc(sizeof *sort_values * n);
+    position_values = xmalloc(sizeof *position_values * n);
+
+    i = 0;
+    while ((node = hmap_at_position(hmap, &pos)) != NULL) {
+        struct element *e = CONTAINER_OF(node, struct element, node);
+
+        assert(i < n);
+        position_values[i++] = e->value;
+    }
+    assert(i == n);
+    assert(pos.bucket == 0);
+    assert(pos.offset == 0);
+
+    memcpy(sort_values, values, sizeof *sort_values * n);
+    qsort(sort_values, n, sizeof *sort_values, compare_ints);
+    qsort(position_values, n, sizeof *position_values, compare_ints);
+
+    for (i = 0; i < n; i++) {
+        assert(sort_values[i] == position_values[i]);
+    }
+
+    free(position_values);
+    free(sort_values);
+}
+
+static struct hmap *
+macro_hmap_arg(struct hmap *hmap)
+{
+    macro_hmap_calls++;
+    return hmap;
+}
+
+static size_t
+macro_shard_arg(size_t shard)
+{
+    macro_shard_calls++;
+    return shard;
+}
+
+static size_t
+macro_shard_count_arg(size_t shard_count)
+{
+    macro_shard_count_calls++;
+    return shard_count;
 }
 
 /* Verifies that 'hmap' contains exactly the 'n' values in 'values'. */
@@ -74,6 +133,7 @@ check_hmap(struct hmap *hmap, const int values[], size_t n,
 
     free(hmap_values);
     free(sort_values);
+    check_hmap_positions(hmap, values, n);
 
     /* Check that all the values are there in lookup. */
     for (i = 0; i < n; i++) {
@@ -89,6 +149,40 @@ check_hmap(struct hmap *hmap, const int values[], size_t n,
     /* Check counters. */
     assert(hmap_is_empty(hmap) == !n);
     assert(hmap_count(hmap) == n);
+}
+
+/* Verifies that shard iteration visits exactly the 'n' values in 'values'. */
+static void
+check_hmap_shards(struct hmap *hmap, const int values[], size_t n,
+                  size_t shard_count)
+{
+    int *sort_values, *hmap_values;
+    struct element *e;
+    size_t i, shard;
+
+    sort_values = xmalloc(sizeof *sort_values * n);
+    hmap_values = xmalloc(sizeof *hmap_values * n);
+
+    i = 0;
+    for (shard = 0; shard < shard_count; shard++) {
+        HMAP_FOR_EACH_SHARD (e, node, hmap, shard, shard_count) {
+            assert(i < n);
+            hmap_values[i++] = e->value;
+        }
+        assert(e == NULL);
+    }
+    assert(i == n);
+
+    memcpy(sort_values, values, sizeof *sort_values * n);
+    qsort(sort_values, n, sizeof *sort_values, compare_ints);
+    qsort(hmap_values, n, sizeof *hmap_values, compare_ints);
+
+    for (i = 0; i < n; i++) {
+        assert(sort_values[i] == hmap_values[i]);
+    }
+
+    free(hmap_values);
+    free(sort_values);
 }
 
 /* Puts the 'n' values in 'values' into 'elements', and then puts those
@@ -127,7 +221,7 @@ print_hmap(const char *name, struct hmap *hmap)
 
     printf("%s:", name);
     HMAP_FOR_EACH (e, node, hmap) {
-        printf(" %d(%"PRIuSIZE")", e->value, e->node.hash & hmap->mask);
+        printf(" %d(%"PRIuSIZE")", e->value, hmap_node_hash(&e->node));
     }
     printf("\n");
 }
@@ -355,6 +449,191 @@ test_hmap_for_each_pop(hash_func *hash)
     }
 }
 
+/* Tests that HMAP_FOR_EACH_SHARD partitions read-only iteration. */
+static void
+test_hmap_for_each_shard(hash_func *hash)
+{
+    enum { N_ELEMS = 96 };
+
+    struct element elements[N_ELEMS];
+    int values[N_ELEMS];
+    struct hmap hmap;
+    struct element *e;
+    size_t init_count, iter_count;
+    size_t n_remaining;
+    size_t i, j;
+
+    make_hmap(&hmap, elements, values, N_ELEMS, hash);
+    check_hmap_shards(&hmap, values, N_ELEMS, 1);
+    check_hmap_shards(&hmap, values, N_ELEMS, 2);
+    check_hmap_shards(&hmap, values, N_ELEMS, 5);
+    check_hmap_shards(&hmap, values, N_ELEMS, N_ELEMS * 2);
+
+    n_remaining = N_ELEMS;
+    for (i = 0; i < N_ELEMS; i += 7) {
+        hmap_remove(&hmap, &elements[i].node);
+        for (j = 0; ; j++) {
+            assert(j < n_remaining);
+            if (values[j] == elements[i].value) {
+                values[j] = values[--n_remaining];
+                break;
+            }
+        }
+    }
+    check_hmap_shards(&hmap, values, n_remaining, 3);
+    check_hmap_shards(&hmap, values, n_remaining, 17);
+
+    init_count = 0;
+    iter_count = 0;
+    HMAP_FOR_EACH_SHARD_INIT (e, node, &hmap, 0, 1, init_count++) {
+        iter_count++;
+    }
+    assert(e == NULL);
+    assert(init_count == 1);
+    assert(iter_count == n_remaining);
+
+    macro_hmap_calls = 0;
+    macro_shard_calls = 0;
+    macro_shard_count_calls = 0;
+    iter_count = 0;
+    HMAP_FOR_EACH_SHARD (e, node, macro_hmap_arg(&hmap),
+                         macro_shard_arg(0), macro_shard_count_arg(1)) {
+        iter_count++;
+    }
+    assert(e == NULL);
+    assert(iter_count == n_remaining);
+    assert(macro_hmap_calls == 1);
+    assert(macro_shard_calls == 1);
+    assert(macro_shard_count_calls == 1);
+
+    hmap_destroy(&hmap);
+
+    hmap_init(&hmap);
+    hmap_reserve(&hmap, HMAP_SWISS_THRESHOLD + N_ELEMS);
+    for (i = 0; i < N_ELEMS; i++) {
+        elements[i].value = i;
+        hmap_insert(&hmap, &elements[i].node, hash(elements[i].value));
+        values[i] = i;
+    }
+    check_hmap_shards(&hmap, values, N_ELEMS, 4);
+    check_hmap_shards(&hmap, values, N_ELEMS, 19);
+    hmap_destroy(&hmap);
+}
+
+static bool
+test_hmap_is_swiss(const struct hmap *hmap)
+{
+    return hmap->mode == HMAP_MODE_SWISS;
+}
+
+/* Tests that the implementation mode knobs select the expected layout. */
+static void
+test_hmap_modes(hash_func *hash)
+{
+    enum { N_ELEMS = 32 };
+
+    struct element elements[N_ELEMS];
+    int values[N_ELEMS];
+    struct hmap hmap;
+    size_t i;
+
+    hmap_init(&hmap);
+#if HMAP_IMPL == HMAP_IMPL_SWISS
+    assert(test_hmap_is_swiss(&hmap));
+#else
+    assert(!test_hmap_is_swiss(&hmap));
+#endif
+
+    hmap_reserve(&hmap, HMAP_SWISS_THRESHOLD + N_ELEMS);
+#if HMAP_IMPL == HMAP_IMPL_CHAINED
+    assert(!test_hmap_is_swiss(&hmap));
+#else
+    assert(test_hmap_is_swiss(&hmap));
+#endif
+
+    for (i = 0; i < N_ELEMS; i++) {
+        elements[i].value = i;
+        hmap_insert(&hmap, &elements[i].node, hash(elements[i].value));
+        values[i] = i;
+    }
+    check_hmap(&hmap, values, N_ELEMS, hash);
+    hmap_destroy(&hmap);
+
+    struct hmap initialized = HMAP_INITIALIZER(&initialized);
+    struct hmap_position pos = { 0, 0 };
+
+    assert(hmap_at_position(&initialized, &pos) == NULL);
+    assert(pos.bucket == 0);
+    assert(pos.offset == 0);
+#if HMAP_IMPL == HMAP_IMPL_SWISS
+    assert(test_hmap_is_swiss(&initialized));
+#else
+    assert(!test_hmap_is_swiss(&initialized));
+#endif
+    hmap_insert(&initialized, &elements[0].node, hash(0));
+    values[0] = 0;
+    check_hmap(&initialized, values, 1, hash);
+    hmap_destroy(&initialized);
+
+    elements[0].value = 0;
+    elements[1].value = 1;
+    elements[0].node.hash = hash(0);
+    elements[0].node.next = &elements[1].node;
+    elements[1].node.hash = hash(1);
+    elements[1].node.next = NULL;
+    struct hmap const_hmap = HMAP_CONST(&const_hmap, 2, &elements[0].node);
+    values[0] = 0;
+    values[1] = 1;
+    check_hmap(&const_hmap, values, 2, hash);
+
+#if HMAP_SWISS_THRESHOLD <= 4096
+    size_t n_promote = HMAP_SWISS_THRESHOLD + N_ELEMS + 1;
+    struct element *many_elements = xmalloc(sizeof *many_elements * n_promote);
+    int *many_values = xmalloc(sizeof *many_values * n_promote);
+
+    hmap_init(&hmap);
+    for (i = 0; i < n_promote; i++) {
+        many_elements[i].value = i;
+        hmap_insert(&hmap, &many_elements[i].node,
+                    hash(many_elements[i].value));
+        many_values[i] = i;
+
+#if HMAP_IMPL == HMAP_IMPL_CHAINED
+        assert(!test_hmap_is_swiss(&hmap));
+#elif HMAP_IMPL == HMAP_IMPL_SWISS
+        assert(test_hmap_is_swiss(&hmap));
+#else
+        assert(test_hmap_is_swiss(&hmap) == (i + 1 > HMAP_SWISS_THRESHOLD));
+#endif
+    }
+    check_hmap(&hmap, many_values, n_promote, hash);
+    hmap_destroy(&hmap);
+    free(many_values);
+    free(many_elements);
+#endif
+
+#if HMAP_IMPL != HMAP_IMPL_CHAINED
+    enum { N_TOMBSTONES = HMAP_SWISS_GROUP_WIDTH };
+    struct element tombstone_elements[N_TOMBSTONES];
+
+    hmap_init(&hmap);
+    hmap_reserve(&hmap, HMAP_SWISS_THRESHOLD + N_TOMBSTONES);
+    assert(test_hmap_is_swiss(&hmap));
+    for (i = 0; i < N_TOMBSTONES; i++) {
+        tombstone_elements[i].value = i;
+        hmap_insert(&hmap, &tombstone_elements[i].node, i);
+    }
+    for (i = 0; i < N_TOMBSTONES; i++) {
+        hmap_remove(&hmap, &tombstone_elements[i].node);
+    }
+    assert(hmap_count(&hmap) == 0);
+    assert(hmap.n_occupied > 0);
+    hmap_clear(&hmap);
+    assert(hmap.n_occupied == 0);
+    hmap_destroy(&hmap);
+#endif
+}
+
 static void
 run_test(void (*function)(hash_func *))
 {
@@ -375,6 +654,8 @@ test_hmap_main(int argc OVS_UNUSED, char *argv[] OVS_UNUSED)
     run_test(test_hmap_for_each_safe);
     run_test(test_hmap_reserve_shrink);
     run_test(test_hmap_for_each_pop);
+    run_test(test_hmap_for_each_shard);
+    run_test(test_hmap_modes);
     printf("\n");
 }
 

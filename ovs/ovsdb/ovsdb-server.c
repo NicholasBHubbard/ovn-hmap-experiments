@@ -727,7 +727,6 @@ main(int argc, char *argv[])
     struct shash_node *node;
     int replication_probe_interval = REPLICATION_DEFAULT_PROBE_INTERVAL;
     int relay_source_probe_interval = RELAY_SOURCE_DEFAULT_PROBE_INTERVAL;
-    struct sset db_filenames = SSET_INITIALIZER(&db_filenames);
     struct shash db_conf = SHASH_INITIALIZER(&db_conf);
     struct shash remotes = SHASH_INITIALIZER(&remotes);
     char *sync_from = NULL, *sync_exclude = NULL;

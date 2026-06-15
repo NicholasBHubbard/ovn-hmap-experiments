@@ -254,15 +254,8 @@ cleanup:
 void
 ovn_fast_hmap_init(struct hmap *hmap, ssize_t mask)
 {
-    size_t i;
-
-    hmap->buckets = xmalloc(sizeof (struct hmap_node *) * (mask + 1));
-    hmap->one = NULL;
-    hmap->mask = mask;
-    hmap->n = 0;
-    for (i = 0; i <= hmap->mask; i++) {
-        hmap->buckets[i] = NULL;
-    }
+    hmap_init(hmap);
+    hmap_reserve(hmap, mask + 1);
 }
 
 /* Initializes 'hmap' as an empty hash table of size X.
@@ -273,22 +266,8 @@ ovn_fast_hmap_init(struct hmap *hmap, ssize_t mask)
 void
 ovn_fast_hmap_size_for(struct hmap *hmap, int size)
 {
-    size_t mask;
-    mask = size / 2;
-    mask |= mask >> 1;
-    mask |= mask >> 2;
-    mask |= mask >> 4;
-    mask |= mask >> 8;
-    mask |= mask >> 16;
-#if SIZE_MAX > UINT32_MAX
-    mask |= mask >> 32;
-#endif
-
-    /* If we need to dynamically allocate buckets we might as well allocate at
-     * least 4 of them. */
-    mask |= (mask & 1) << 1;
-
-    fast_hmap_init(hmap, mask);
+    hmap_init(hmap);
+    hmap_reserve(hmap, size);
 }
 
 /* Run a thread pool which uses a callback function to process results
@@ -374,30 +353,17 @@ ovn_run_pool(struct worker_pool *pool)
 void
 ovn_fast_hmap_merge(struct hmap *dest, struct hmap *inc)
 {
-    size_t i;
+    struct hmap_node *node;
 
-    ovs_assert(inc->mask == dest->mask);
-
-    if (!inc->n) {
+    if (hmap_is_empty(inc)) {
         /* Request to merge an empty frag, nothing to do */
         return;
     }
 
-    for (i = 0; i <= dest->mask; i++) {
-        struct hmap_node **dest_bucket = &dest->buckets[i];
-        struct hmap_node **inc_bucket = &inc->buckets[i];
-        if (*inc_bucket != NULL) {
-            struct hmap_node *last_node = *inc_bucket;
-            while (last_node->next != NULL) {
-                last_node = last_node->next;
-            }
-            last_node->next = *dest_bucket;
-            *dest_bucket = *inc_bucket;
-            *inc_bucket = NULL;
-        }
+    while ((node = hmap_first(inc)) != NULL) {
+        hmap_remove(inc, node);
+        hmap_insert_fast(dest, node, node->hash);
     }
-    dest->n += inc->n;
-    inc->n = 0;
 }
 
 /* Run a thread pool which gathers results in an array
@@ -423,14 +389,17 @@ ovn_run_pool_list(struct worker_pool *pool,
 }
 
 void
-ovn_update_hashrow_locks(struct hmap *lflows, struct hashrow_locks *hrl)
+ovn_update_hashrow_locks(struct hmap *lflows OVS_UNUSED,
+                         struct hashrow_locks *hrl)
 {
+    enum { HASHROW_LOCK_MASK = 4095 };
     int i;
-    if (hrl->mask != lflows->mask) {
+    if (hrl->mask != HASHROW_LOCK_MASK) {
         hrl->row_locks = xrealloc(hrl->row_locks,
-                                  sizeof *hrl->row_locks * (lflows->mask + 1));
-        hrl->mask = lflows->mask;
-        for (i = 0; i <= lflows->mask; i++) {
+                                  sizeof *hrl->row_locks
+                                  * (HASHROW_LOCK_MASK + 1));
+        hrl->mask = HASHROW_LOCK_MASK;
+        for (i = 0; i <= HASHROW_LOCK_MASK; i++) {
             ovs_mutex_init(&hrl->row_locks[i]);
         }
     }

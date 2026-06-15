@@ -48,6 +48,8 @@ static struct ovn_lflow *ovn_lflow_find(const struct hmap *lflows,
                                         const char *ctrl_meter,
                                         bool acl_ct_translation,
                                         uint32_t hash);
+static void ovn_lflow_destroy_from(struct hmap *lflows,
+                                   struct ovn_lflow *lflow);
 static void ovn_lflow_destroy(struct lflow_table *lflow_table,
                               struct ovn_lflow *lflow);
 static char *ovn_lflow_hint(const struct ovsdb_idl_row *row);
@@ -62,7 +64,9 @@ static struct ovn_lflow *do_ovn_lflow_add(
     bool acl_ct_translation);
 
 
-static struct ovs_mutex *lflow_hash_lock(const struct hmap *lflow_table,
+static struct hmap *lflow_table_parallel_target(
+    struct lflow_table *lflow_table, uint32_t hash);
+static struct ovs_mutex *lflow_hash_lock(struct lflow_table *lflow_table,
                                          uint32_t hash);
 static void lflow_hash_unlock(struct ovs_mutex *hash_lock);
 
@@ -103,7 +107,6 @@ static bool sync_lflow_to_sb(struct ovn_lflow *,
 /* TODO:  Move the parallization logic to this module to avoid accessing
  * and modifying in both northd.c and lflow-mgr.c. */
 extern int parallelization_state;
-extern thread_local size_t thread_lflow_counter;
 extern int search_mode;
 
 
@@ -118,31 +121,17 @@ static struct lflow_ref_node *lflow_ref_node_find(struct hmap *lflow_ref_nodes,
                                                   uint32_t lflow_hash);
 static void lflow_ref_node_destroy(struct lflow_ref_node *);
 
-static bool lflow_hash_lock_initialized = false;
-/* The lflow_hash_lock is a mutex array that protects updates to the shared
- * lflow table across threads when parallel lflow build and dp-group are both
- * enabled. To avoid high contention between threads, a big array of mutexes
- * are used instead of just one. This is possible because when parallel build
- * is used we only use hmap_insert_fast() to update the hmap, which would not
- * touch the bucket array but only the list in a single bucket. We only need to
- * make sure that when adding lflows to the same hash bucket, the same lock is
- * used, so that no two threads can add to the bucket at the same time.  It is
- * ok that the same lock is used to protect multiple buckets, so a fixed sized
- * mutex array is used instead of 1-1 mapping to the hash buckets. This
- * simplies the implementation while effectively reduces lock contention
- * because the chance that different threads contending the same lock amongst
- * the big number of locks is very low. */
-#define LFLOW_HASH_LOCK_MASK 0xFFFF
-static struct ovs_mutex lflow_hash_locks[LFLOW_HASH_LOCK_MASK + 1];
+#define LFLOW_PARALLEL_MIN_SHARDS 16
+#define LFLOW_PARALLEL_MAX_SHARDS 4096
 
-/* Full thread safety analysis is not possible with hash locks, because
- * they are taken conditionally based on the 'parallelization_state' and
- * a flow hash.  Also, the order in which two hash locks are taken is not
- * predictable during the static analysis.
+/* Full thread safety analysis is not possible with lflow table shard locks,
+ * because they are taken conditionally based on whether parallel inserts are
+ * active and on a flow hash.  Also, the order in which two shard locks are
+ * taken is not predictable during the static analysis.
  *
  * Since the order of taking two locks depends on a random hash, to avoid
- * ABBA deadlocks, no two hash locks can be nested.  In that sense an array
- * of hash locks is similar to a single mutex.
+ * ABBA deadlocks, no two shard locks can be nested.  In that sense an array
+ * of shard locks is similar to a single mutex.
  *
  * Using a fake mutex to partially simulate thread safety restrictions, as
  * if it were actually a single mutex.
@@ -209,6 +198,10 @@ lflow_table_alloc(void)
 void
 lflow_table_init(struct lflow_table *lflow_table)
 {
+    lflow_table->parallel_entries = NULL;
+    lflow_table->parallel_locks = NULL;
+    lflow_table->parallel_mask = 0;
+    lflow_table->parallel_active = false;
     fast_hmap_size_for(&lflow_table->entries,
                        lflow_table->max_seen_lflow_size);
     for (enum ovn_datapath_type i = DP_MIN; i < DP_MAX; i++) {
@@ -220,6 +213,9 @@ void
 lflow_table_clear(struct lflow_table *lflow_table, bool destroy_all)
 {
     struct ovn_lflow *lflow;
+
+    lflow_table_finish_parallel(lflow_table);
+
     HMAP_FOR_EACH_SAFE (lflow, hmap_node, &lflow_table->entries) {
         if (!destroy_all) {
             lflow->sync_state = LFLOW_STALE;
@@ -238,6 +234,14 @@ lflow_table_destroy(struct lflow_table *lflow_table)
 {
     lflow_table_clear(lflow_table, true);
     hmap_destroy(&lflow_table->entries);
+    if (lflow_table->parallel_entries) {
+        for (size_t i = 0; i <= lflow_table->parallel_mask; i++) {
+            hmap_destroy(&lflow_table->parallel_entries[i]);
+            ovs_mutex_destroy(&lflow_table->parallel_locks[i]);
+        }
+        free(lflow_table->parallel_entries);
+        free(lflow_table->parallel_locks);
+    }
     for (enum ovn_datapath_type i = DP_MIN; i < DP_MAX; i++) {
         ovn_dp_groups_destroy(&lflow_table->dp_groups[i]);
     }
@@ -255,10 +259,99 @@ lflow_table_expand(struct lflow_table *lflow_table)
     }
 }
 
-void
-lflow_table_set_size(struct lflow_table *lflow_table, size_t size)
+static size_t
+lflow_table_parallel_shard_count(size_t n_threads)
 {
-    lflow_table->entries.n = size;
+    size_t n_shards = n_threads * 4;
+    size_t pow2 = 1;
+
+    if (n_shards < LFLOW_PARALLEL_MIN_SHARDS) {
+        n_shards = LFLOW_PARALLEL_MIN_SHARDS;
+    } else if (n_shards > LFLOW_PARALLEL_MAX_SHARDS) {
+        n_shards = LFLOW_PARALLEL_MAX_SHARDS;
+    }
+
+    while (pow2 < n_shards) {
+        pow2 <<= 1;
+    }
+
+    return pow2;
+}
+
+void
+lflow_table_prepare_parallel(struct lflow_table *lflow_table,
+                             size_t n_threads)
+{
+    size_t n_shards = lflow_table_parallel_shard_count(n_threads);
+    size_t per_shard = lflow_table->max_seen_lflow_size / n_shards + 1;
+
+    ovs_assert(n_threads > 1);
+    lflow_table_finish_parallel(lflow_table);
+
+    if (lflow_table->parallel_entries &&
+        lflow_table->parallel_mask != n_shards - 1) {
+        for (size_t i = 0; i <= lflow_table->parallel_mask; i++) {
+            hmap_destroy(&lflow_table->parallel_entries[i]);
+            ovs_mutex_destroy(&lflow_table->parallel_locks[i]);
+        }
+        free(lflow_table->parallel_entries);
+        free(lflow_table->parallel_locks);
+        lflow_table->parallel_entries = NULL;
+        lflow_table->parallel_locks = NULL;
+        lflow_table->parallel_mask = 0;
+    }
+
+    if (!lflow_table->parallel_entries) {
+        lflow_table->parallel_entries = xmalloc(
+            n_shards * sizeof *lflow_table->parallel_entries);
+        lflow_table->parallel_locks = xmalloc(
+            n_shards * sizeof *lflow_table->parallel_locks);
+        lflow_table->parallel_mask = n_shards - 1;
+        for (size_t i = 0; i < n_shards; i++) {
+            fast_hmap_size_for(&lflow_table->parallel_entries[i], per_shard);
+            ovs_mutex_init(&lflow_table->parallel_locks[i]);
+        }
+    } else {
+        for (size_t i = 0; i < n_shards; i++) {
+            ovs_assert(hmap_is_empty(&lflow_table->parallel_entries[i]));
+            hmap_reserve(&lflow_table->parallel_entries[i], per_shard);
+        }
+    }
+
+    lflow_table->parallel_active = true;
+}
+
+void
+lflow_table_finish_parallel(struct lflow_table *lflow_table)
+{
+    if (!lflow_table->parallel_active) {
+        return;
+    }
+
+    for (size_t i = 0; i <= lflow_table->parallel_mask; i++) {
+        struct hmap *parallel_entries = &lflow_table->parallel_entries[i];
+        struct hmap_node *node;
+
+        while ((node = hmap_first(parallel_entries)) != NULL) {
+            struct ovn_lflow *lflow =
+                CONTAINER_OF(node, struct ovn_lflow, hmap_node);
+            uint32_t hash = hmap_node_hash(node);
+            struct ovn_lflow *old_lflow;
+
+            hmap_remove(parallel_entries, node);
+            old_lflow = ovn_lflow_find(&lflow_table->entries, lflow->stage,
+                                       lflow->priority, lflow->match,
+                                       lflow->actions, lflow->ctrl_meter,
+                                       lflow->acl_ct_translation, hash);
+            if (old_lflow) {
+                ovs_assert(old_lflow->sync_state == LFLOW_STALE);
+                ovn_lflow_destroy(lflow_table, old_lflow);
+            }
+            hmap_insert_fast(&lflow_table->entries, node, hash);
+        }
+    }
+
+    lflow_table->parallel_active = false;
 }
 
 void
@@ -756,7 +849,7 @@ lflow_table_add_lflow__(struct lflow_table *lflow_table,
                                  priority, match,
                                  actions, acl_ct_translation);
 
-    hash_lock = lflow_hash_lock(&lflow_table->entries, hash);
+    hash_lock = lflow_hash_lock(lflow_table, hash);
     struct ovn_lflow *lflow =
         do_ovn_lflow_add(lflow_table,
                          sdp ? sparse_array_len(&sdp->dps->dps_array)
@@ -913,28 +1006,6 @@ ovn_dp_groups_destroy(struct hmap *dp_groups)
     hmap_destroy(dp_groups);
 }
 
-void
-lflow_hash_lock_init(void)
-{
-    if (!lflow_hash_lock_initialized) {
-        for (size_t i = 0; i < LFLOW_HASH_LOCK_MASK + 1; i++) {
-            ovs_mutex_init(&lflow_hash_locks[i]);
-        }
-        lflow_hash_lock_initialized = true;
-    }
-}
-
-void
-lflow_hash_lock_destroy(void)
-{
-    if (lflow_hash_lock_initialized) {
-        for (size_t i = 0; i < LFLOW_HASH_LOCK_MASK + 1; i++) {
-            ovs_mutex_destroy(&lflow_hash_locks[i]);
-        }
-    }
-    lflow_hash_lock_initialized = false;
-}
-
 /* static functions. */
 static void
 ovn_lflow_init(struct ovn_lflow *lflow,
@@ -963,16 +1034,24 @@ ovn_lflow_init(struct ovn_lflow *lflow,
     ovs_list_init(&lflow->referenced_by);
 }
 
+static struct hmap *
+lflow_table_parallel_target(struct lflow_table *lflow_table, uint32_t hash)
+{
+    return lflow_table->parallel_active
+           ? &lflow_table->parallel_entries[hash & lflow_table->parallel_mask]
+           : NULL;
+}
+
 static struct ovs_mutex *
-lflow_hash_lock(const struct hmap *lflow_table, uint32_t hash)
+lflow_hash_lock(struct lflow_table *lflow_table, uint32_t hash)
     OVS_ACQUIRES(fake_hash_mutex)
     OVS_NO_THREAD_SAFETY_ANALYSIS
 {
     struct ovs_mutex *hash_lock = NULL;
 
-    if (parallelization_state == STATE_USE_PARALLELIZATION) {
+    if (lflow_table->parallel_active) {
         hash_lock =
-            &lflow_hash_locks[hash & lflow_table->mask & LFLOW_HASH_LOCK_MASK];
+            &lflow_table->parallel_locks[hash & lflow_table->parallel_mask];
         ovs_mutex_lock(hash_lock);
     }
     return hash_lock;
@@ -1029,9 +1108,9 @@ ovn_lflow_hint(const struct ovsdb_idl_row *row)
 }
 
 static void
-ovn_lflow_destroy(struct lflow_table *lflow_table, struct ovn_lflow *lflow)
+ovn_lflow_destroy_from(struct hmap *lflows, struct ovn_lflow *lflow)
 {
-    hmap_remove(&lflow_table->entries, &lflow->hmap_node);
+    hmap_remove(lflows, &lflow->hmap_node);
     dynamic_bitmap_free(&lflow->dpg_bitmap);
     free(lflow->match);
     free(lflow->actions);
@@ -1046,6 +1125,12 @@ ovn_lflow_destroy(struct lflow_table *lflow_table, struct ovn_lflow *lflow)
     free(lflow);
 }
 
+static void
+ovn_lflow_destroy(struct lflow_table *lflow_table, struct ovn_lflow *lflow)
+{
+    ovn_lflow_destroy_from(&lflow_table->entries, lflow);
+}
+
 static struct ovn_lflow *
 do_ovn_lflow_add(struct lflow_table *lflow_table, size_t dp_bitmap_len,
                  uint32_t hash, const struct ovn_stage *stage,
@@ -1056,22 +1141,32 @@ do_ovn_lflow_add(struct lflow_table *lflow_table, size_t dp_bitmap_len,
                  bool acl_ct_translation)
     OVS_REQUIRES(fake_hash_mutex)
 {
+    struct hmap *parallel_entries;
     struct ovn_lflow *old_lflow;
     struct ovn_lflow *lflow;
     struct uuid sbuuid = UUID_ZERO;
 
     ovs_assert(dp_bitmap_len);
 
-    old_lflow = ovn_lflow_find(&lflow_table->entries, stage,
-                               priority, match, actions, ctrl_meter,
-                               acl_ct_translation, hash);
+    parallel_entries = lflow_table_parallel_target(lflow_table, hash);
+    old_lflow = parallel_entries
+                ? ovn_lflow_find(parallel_entries, stage, priority, match,
+                                 actions, ctrl_meter, acl_ct_translation, hash)
+                : NULL;
+    if (!old_lflow) {
+        old_lflow = ovn_lflow_find(&lflow_table->entries, stage,
+                                   priority, match, actions, ctrl_meter,
+                                   acl_ct_translation, hash);
+    }
     if (old_lflow) {
         dynamic_bitmap_realloc(&old_lflow->dpg_bitmap, dp_bitmap_len);
         if (old_lflow->sync_state != LFLOW_STALE) {
             return old_lflow;
         }
         sbuuid = old_lflow->sb_uuid;
-        ovn_lflow_destroy(lflow_table, old_lflow);
+        if (!parallel_entries) {
+            ovn_lflow_destroy(lflow_table, old_lflow);
+        }
     }
 
     lflow = xzalloc(sizeof *lflow);
@@ -1086,14 +1181,10 @@ do_ovn_lflow_add(struct lflow_table *lflow_table, size_t dp_bitmap_len,
                    acl_ct_translation, where,
                    flow_desc, sbuuid);
 
-    if (parallelization_state != STATE_USE_PARALLELIZATION) {
+    if (!parallel_entries) {
         hmap_insert(&lflow_table->entries, &lflow->hmap_node, hash);
     } else {
-        hmap_insert_fast(&lflow_table->entries, &lflow->hmap_node,
-                         hash);
-        if (uuid_is_zero(&lflow->sb_uuid)) {
-            thread_lflow_counter++;
-        }
+        hmap_insert_fast(parallel_entries, &lflow->hmap_node, hash);
     }
 
     return lflow;

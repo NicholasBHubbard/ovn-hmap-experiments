@@ -91,7 +91,6 @@ struct smap_node {
             .value = CONST_CAST(char *, VALUE), \
         }.node
 
-
 void smap_init(struct smap *);
 void smap_destroy(struct smap *);
 
