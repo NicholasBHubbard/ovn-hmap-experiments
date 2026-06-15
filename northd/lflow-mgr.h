@@ -17,6 +17,8 @@
 #define LFLOW_MGR_H 1
 
 #include "include/openvswitch/hmap.h"
+#include "include/openvswitch/swtab.h"
+#include "include/openvswitch/thread.h"
 #include "include/openvswitch/uuid.h"
 
 #include "northd.h"
@@ -27,18 +29,22 @@ struct ovsdb_idl_row;
 struct ovn_lflow;
 
 /* lflow map which stores the logical flows. */
+#define LFLOW_TABLE_N_SHARDS 256
+
+struct lflow_table_shard {
+    struct swtab entries;       /* Contains "struct ovn_lflow"s. */
+    struct ovs_mutex mutex;
+};
+
 struct lflow_table {
-    struct hmap entries; /* hmap of lflows. */
+    struct lflow_table_shard shards[LFLOW_TABLE_N_SHARDS];
     struct hmap dp_groups[DP_MAX];
-    ssize_t max_seen_lflow_size;
 };
 
 struct lflow_table *lflow_table_alloc(void);
 void lflow_table_init(struct lflow_table *);
 void lflow_table_clear(struct lflow_table *, bool);
 void lflow_table_destroy(struct lflow_table *);
-void lflow_table_expand(struct lflow_table *);
-void lflow_table_set_size(struct lflow_table *, size_t);
 void lflow_table_sync_to_sb(struct lflow_table *,
                             struct ovsdb_idl_txn *ovnsb_txn,
                             const struct ovn_synced_datapaths dps[DP_MAX],

@@ -5781,19 +5781,6 @@ northd_handle_lb_data_changes(struct tracked_lb_data *trk_lb_data,
 
 int parallelization_state = STATE_NULL;
 
-
-/* This thread-local var is used for parallel lflow building when dp-groups is
- * enabled. It maintains the number of lflows inserted by the current thread to
- * the shared lflow hmap in the current iteration. It is needed because the
- * lflow_hash_lock cannot protect current update of the hmap's size (hmap->n)
- * by different threads.
- *
- * When all threads complete the tasks of an iteration, the counters of all the
- * threads are collected to fix the lflow hmap's size (by the function
- * fix_flow_map_size()).
- * */
-thread_local size_t thread_lflow_counter = 0;
-
 static bool
 build_dhcpv4_action(struct ovn_port *op, ovs_be32 offer_ip,
                     struct ds *options_action, struct ds *response_action,
@@ -19275,7 +19262,6 @@ struct lswitch_flow_build_info {
     char *svc_check_match;
     struct ds match;
     struct ds actions;
-    size_t thread_lflow_counter;
     const char *svc_monitor_mac;
     const struct sampling_app_table *sampling_apps;
     const struct group_ecmp_route_data *route_data;
@@ -19484,7 +19470,6 @@ build_lflows_thread(void *arg)
         if (stop_parallel_processing()) {
             return NULL;
         }
-        thread_lflow_counter = 0;
         if (lsi) {
             /* Iterate over bucket ThreadID, ThreadID+size, ... */
             for (bnum = control->id;
@@ -19619,7 +19604,6 @@ build_lflows_thread(void *arg)
                                             lsi->sbrec_acl_id_table);
                 }
             }
-            lsi->thread_lflow_counter = thread_lflow_counter;
         }
         post_completed_work(control);
     }
@@ -19635,27 +19619,6 @@ noop_callback(struct worker_pool *pool OVS_UNUSED,
               size_t index OVS_UNUSED)
 {
     /* Do nothing */
-}
-
-/* Fixes the hmap size (hmap->n) after parallel building the lflow_table when
- * dp-groups is enabled, because in that case all threads are updating the
- * global lflow hmap. Although the lflow_hash_lock prevents currently inserting
- * to the same hash bucket, the hmap->n is updated currently by all threads and
- * may not be accurate at the end of each iteration. This function collects the
- * thread-local lflow counters maintained by each thread and update the hmap
- * size with the aggregated value. This function must be called immediately
- * after the worker threads complete the tasks in each iteration before any
- * future operations on the lflow map. */
-static void
-fix_flow_table_size(struct lflow_table *lflow_table,
-                  struct lswitch_flow_build_info *lsiv,
-                  size_t n_lsiv, size_t start)
-{
-    size_t total = start;
-    for (size_t i = 0; i < n_lsiv; i++) {
-        total += lsiv[i].thread_lflow_counter;
-    }
-    lflow_table_set_size(lflow_table, total);
 }
 
 static void
@@ -19712,7 +19675,6 @@ build_lswitch_and_lrouter_flows(
             lsiv[index].bfd_ports = bfd_ports;
             lsiv[index].features = features;
             lsiv[index].svc_check_match = svc_check_match;
-            lsiv[index].thread_lflow_counter = 0;
             lsiv[index].svc_monitor_mac = svc_monitor_mac;
             lsiv[index].sampling_apps = sampling_apps;
             lsiv[index].route_data = route_data;
@@ -19726,10 +19688,7 @@ build_lswitch_and_lrouter_flows(
         }
 
         /* Run thread pool. */
-        size_t current_lflow_table_size = hmap_count(&lflows->entries);
         run_pool_callback(build_lflows_pool, NULL, NULL, noop_callback);
-        fix_flow_table_size(lflows, lsiv, build_lflows_pool->size,
-                            current_lflow_table_size);
 
         for (index = 0; index < build_lflows_pool->size; index++) {
             ds_destroy(&lsiv[index].match);
@@ -19954,10 +19913,6 @@ void build_lflows(struct ovsdb_idl_txn *ovnsb_txn,
     if (parallelization_state == STATE_INIT_HASH_SIZES) {
         parallelization_state = STATE_USE_PARALLELIZATION;
     }
-
-    /* Parallel build may result in a suboptimal hash. Resize the
-     * lflow map to a correct size before doing lookups */
-    lflow_table_expand(lflows);
 
     stopwatch_start(LFLOWS_TO_SB_STOPWATCH_NAME, time_msec());
     lflow_table_sync_to_sb(lflows, ovnsb_txn, input_data->dps,

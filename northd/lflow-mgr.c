@@ -41,7 +41,7 @@ static void ovn_lflow_init(struct ovn_lflow *,
                            char *ctrl_meter, char *stage_hint,
                            bool acl_ct_translation, const char *where,
                            const char *flow_desc, struct uuid sbuuid);
-static struct ovn_lflow *ovn_lflow_find(const struct hmap *lflows,
+static struct ovn_lflow *ovn_lflow_find(const struct swtab *lflows,
                                         const struct ovn_stage *stage,
                                         uint16_t priority, const char *match,
                                         const char *actions,
@@ -62,8 +62,7 @@ static struct ovn_lflow *do_ovn_lflow_add(
     bool acl_ct_translation);
 
 
-static struct ovs_mutex *lflow_hash_lock(const struct hmap *lflow_table,
-                                         uint32_t hash);
+static struct ovs_mutex *lflow_hash_lock(struct lflow_table *, uint32_t hash);
 static void lflow_hash_unlock(struct ovs_mutex *hash_lock);
 
 static struct sbrec_logical_dp_group *ovn_sb_insert_or_update_logical_dp_group(
@@ -103,7 +102,6 @@ static bool sync_lflow_to_sb(struct ovn_lflow *,
 /* TODO:  Move the parallization logic to this module to avoid accessing
  * and modifying in both northd.c and lflow-mgr.c. */
 extern int parallelization_state;
-extern thread_local size_t thread_lflow_counter;
 extern int search_mode;
 
 
@@ -119,21 +117,10 @@ static struct lflow_ref_node *lflow_ref_node_find(struct hmap *lflow_ref_nodes,
 static void lflow_ref_node_destroy(struct lflow_ref_node *);
 
 static bool lflow_hash_lock_initialized = false;
-/* The lflow_hash_lock is a mutex array that protects updates to the shared
- * lflow table across threads when parallel lflow build and dp-group are both
- * enabled. To avoid high contention between threads, a big array of mutexes
- * are used instead of just one. This is possible because when parallel build
- * is used we only use hmap_insert_fast() to update the hmap, which would not
- * touch the bucket array but only the list in a single bucket. We only need to
- * make sure that when adding lflows to the same hash bucket, the same lock is
- * used, so that no two threads can add to the bucket at the same time.  It is
- * ok that the same lock is used to protect multiple buckets, so a fixed sized
- * mutex array is used instead of 1-1 mapping to the hash buckets. This
- * simplies the implementation while effectively reduces lock contention
- * because the chance that different threads contending the same lock amongst
- * the big number of locks is very low. */
-#define LFLOW_HASH_LOCK_MASK 0xFFFF
-static struct ovs_mutex lflow_hash_locks[LFLOW_HASH_LOCK_MASK + 1];
+/* lflow_table uses sharded swtabs.  Each shard can resize and probe
+ * independently, so parallel writers only need to serialize against other
+ * writers in the same shard. */
+#define LFLOW_TABLE_INITIAL_SIZE 128
 
 /* Full thread safety analysis is not possible with hash locks, because
  * they are taken conditionally based on the 'parallelization_state' and
@@ -173,7 +160,7 @@ enum ovn_lflow_state {
  *
  * */
 struct ovn_lflow {
-    struct hmap_node hmap_node;
+    struct swtab_node swtab_node;
 
     const struct ovn_synced_datapath *dp;
     struct dynamic_bitmap dpg_bitmap;
@@ -197,11 +184,55 @@ struct ovn_lflow {
     enum ovn_lflow_state sync_state;
 };
 
+static size_t
+lflow_table_shard_idx(size_t hash)
+{
+    return (hash >> 7) & (LFLOW_TABLE_N_SHARDS - 1);
+}
+
+static struct lflow_table_shard *
+lflow_table_shard_for_hash(struct lflow_table *lflow_table, size_t hash)
+{
+    return &lflow_table->shards[lflow_table_shard_idx(hash)];
+}
+
+static struct lflow_table_shard *
+lflow_table_shard_for_lflow(struct lflow_table *lflow_table,
+                            const struct ovn_lflow *lflow)
+{
+    return lflow_table_shard_for_hash(lflow_table,
+                                      swtab_node_hash(&lflow->swtab_node));
+}
+
+static size_t
+lflow_table_reserve_per_shard(size_t capacity)
+{
+    return DIV_ROUND_UP(capacity, LFLOW_TABLE_N_SHARDS);
+}
+
+static void
+lflow_table_insert(struct lflow_table *lflow_table, struct ovn_lflow *lflow,
+                   size_t hash)
+{
+    struct lflow_table_shard *shard =
+        lflow_table_shard_for_hash(lflow_table, hash);
+
+    swtab_insert(&shard->entries, &lflow->swtab_node, hash);
+}
+
+static void
+lflow_table_remove(struct lflow_table *lflow_table, struct ovn_lflow *lflow)
+{
+    struct lflow_table_shard *shard =
+        lflow_table_shard_for_lflow(lflow_table, lflow);
+
+    swtab_remove(&shard->entries, &lflow->swtab_node);
+}
+
 struct lflow_table *
 lflow_table_alloc(void)
 {
     struct lflow_table *lflow_table = xzalloc(sizeof *lflow_table);
-    lflow_table->max_seen_lflow_size = 128;
 
     return lflow_table;
 }
@@ -209,8 +240,14 @@ lflow_table_alloc(void)
 void
 lflow_table_init(struct lflow_table *lflow_table)
 {
-    fast_hmap_size_for(&lflow_table->entries,
-                       lflow_table->max_seen_lflow_size);
+    size_t shard_capacity =
+        lflow_table_reserve_per_shard(LFLOW_TABLE_INITIAL_SIZE);
+
+    for (size_t i = 0; i < LFLOW_TABLE_N_SHARDS; i++) {
+        swtab_init(&lflow_table->shards[i].entries);
+        swtab_reserve(&lflow_table->shards[i].entries, shard_capacity);
+        ovs_mutex_init(&lflow_table->shards[i].mutex);
+    }
     for (enum ovn_datapath_type i = DP_MIN; i < DP_MAX; i++) {
         ovn_dp_groups_init(&lflow_table->dp_groups[i]);
     }
@@ -220,11 +257,15 @@ void
 lflow_table_clear(struct lflow_table *lflow_table, bool destroy_all)
 {
     struct ovn_lflow *lflow;
-    HMAP_FOR_EACH_SAFE (lflow, hmap_node, &lflow_table->entries) {
-        if (!destroy_all) {
-            lflow->sync_state = LFLOW_STALE;
-        } else {
-            ovn_lflow_destroy(lflow_table, lflow);
+    for (size_t i = 0; i < LFLOW_TABLE_N_SHARDS; i++) {
+        struct swtab *entries = &lflow_table->shards[i].entries;
+
+        SWTAB_FOR_EACH_SAFE (lflow, swtab_node, entries) {
+            if (!destroy_all) {
+                lflow->sync_state = LFLOW_STALE;
+            } else {
+                ovn_lflow_destroy(lflow_table, lflow);
+            }
         }
     }
 
@@ -237,28 +278,14 @@ void
 lflow_table_destroy(struct lflow_table *lflow_table)
 {
     lflow_table_clear(lflow_table, true);
-    hmap_destroy(&lflow_table->entries);
+    for (size_t i = 0; i < LFLOW_TABLE_N_SHARDS; i++) {
+        swtab_destroy(&lflow_table->shards[i].entries);
+        ovs_mutex_destroy(&lflow_table->shards[i].mutex);
+    }
     for (enum ovn_datapath_type i = DP_MIN; i < DP_MAX; i++) {
         ovn_dp_groups_destroy(&lflow_table->dp_groups[i]);
     }
     free(lflow_table);
-}
-
-void
-lflow_table_expand(struct lflow_table *lflow_table)
-{
-    hmap_expand(&lflow_table->entries);
-
-    if (hmap_count(&lflow_table->entries) >
-            lflow_table->max_seen_lflow_size) {
-        lflow_table->max_seen_lflow_size = hmap_count(&lflow_table->entries);
-    }
-}
-
-void
-lflow_table_set_size(struct lflow_table *lflow_table, size_t size)
-{
-    lflow_table->entries.n = size;
 }
 
 void
@@ -270,44 +297,50 @@ lflow_table_sync_to_sb(struct lflow_table *lflow_table,
                        const struct sbrec_logical_dp_group_table *dpgrp_table)
 {
     struct uuidset sb_uuid_set = UUIDSET_INITIALIZER(&sb_uuid_set);
-    struct hmap lflows_temp = HMAP_INITIALIZER(&lflows_temp);
-    struct hmap *lflows = &lflow_table->entries;
+    struct swtab lflows_temp[LFLOW_TABLE_N_SHARDS];
     struct ovn_lflow *lflow;
     const struct sbrec_logical_flow *sbflow;
 
-    fast_hmap_size_for(&lflows_temp,
-                       lflow_table->max_seen_lflow_size);
-
-    HMAP_FOR_EACH_SAFE (lflow, hmap_node, lflows) {
-        if (search_mode != LFLOW_TABLE_SEARCH_SBUUID) {
-            break;
-        }
-
-        if (lflow->sync_state == LFLOW_STALE) {
-            ovn_lflow_destroy(lflow_table, lflow);
-            continue;
-        }
-        sbflow = NULL;
-        if (!uuid_is_zero(&lflow->sb_uuid)) {
-            sbflow = sbrec_logical_flow_table_get_for_uuid(sb_flow_table,
-                                                           &lflow->sb_uuid);
-        }
-        const struct ovn_synced_datapaths *datapaths;
-        struct hmap *dp_groups;
-        enum ovn_datapath_type dp_type =
-            ovn_stage_to_datapath_type(lflow->stage);
-        ovs_assert(dp_type < DP_MAX);
-
-        dp_groups = &lflow_table->dp_groups[dp_type];
-        datapaths = &dps[dp_type];
-        sync_lflow_to_sb(lflow, ovnsb_txn, dp_groups, datapaths,
-                         ovn_internal_version_changed,
-                         sbflow, dpgrp_table);
-        uuidset_insert(&sb_uuid_set, &lflow->sb_uuid);
-        hmap_remove(lflows, &lflow->hmap_node);
-        hmap_insert(&lflows_temp, &lflow->hmap_node,
-                    hmap_node_hash(&lflow->hmap_node));
+    for (size_t i = 0; i < LFLOW_TABLE_N_SHARDS; i++) {
+        swtab_init(&lflows_temp[i]);
+        swtab_reserve(&lflows_temp[i],
+                      swtab_count(&lflow_table->shards[i].entries));
     }
+
+    if (search_mode == LFLOW_TABLE_SEARCH_SBUUID) {
+        for (size_t i = 0; i < LFLOW_TABLE_N_SHARDS; i++) {
+            struct swtab *lflows = &lflow_table->shards[i].entries;
+
+            SWTAB_FOR_EACH_SAFE (lflow, swtab_node, lflows) {
+                if (lflow->sync_state == LFLOW_STALE) {
+                    ovn_lflow_destroy(lflow_table, lflow);
+                    continue;
+                }
+                sbflow = NULL;
+                if (!uuid_is_zero(&lflow->sb_uuid)) {
+                    sbflow = sbrec_logical_flow_table_get_for_uuid(
+                        sb_flow_table, &lflow->sb_uuid);
+                }
+                const struct ovn_synced_datapaths *datapaths;
+                struct hmap *dp_groups;
+                enum ovn_datapath_type dp_type =
+                    ovn_stage_to_datapath_type(lflow->stage);
+                ovs_assert(dp_type < DP_MAX);
+
+                dp_groups = &lflow_table->dp_groups[dp_type];
+                datapaths = &dps[dp_type];
+                sync_lflow_to_sb(lflow, ovnsb_txn, dp_groups, datapaths,
+                                 ovn_internal_version_changed,
+                                 sbflow, dpgrp_table);
+                uuidset_insert(&sb_uuid_set, &lflow->sb_uuid);
+                size_t hash = swtab_node_hash(&lflow->swtab_node);
+                swtab_remove(lflows, &lflow->swtab_node);
+                swtab_insert(&lflows_temp[lflow_table_shard_idx(hash)],
+                             &lflow->swtab_node, hash);
+            }
+        }
+    }
+
     /* Push changes to the Logical_Flow table to database. */
     SBREC_LOGICAL_FLOW_TABLE_FOR_EACH_SAFE (sbflow, sb_flow_table) {
         if (search_mode == LFLOW_TABLE_SEARCH_SBUUID) {
@@ -368,10 +401,12 @@ lflow_table_sync_to_sb(struct lflow_table *lflow_table,
 
         bool acl_ct_translation = smap_get_bool(&sbflow->tags,
                                                 "acl_ct_translation", false);
-        lflow = ovn_lflow_find(
-            lflows, &stage,
-            sbflow->priority, sbflow->match, sbflow->actions,
-            sbflow->controller_meter, acl_ct_translation, sbflow->hash);
+        struct lflow_table_shard *shard =
+            lflow_table_shard_for_hash(lflow_table, sbflow->hash);
+        lflow = ovn_lflow_find(&shard->entries, &stage,
+                               sbflow->priority, sbflow->match,
+                               sbflow->actions, sbflow->controller_meter,
+                               acl_ct_translation, sbflow->hash);
         if (lflow) {
             const struct ovn_synced_datapaths *datapaths;
             struct hmap *dp_groups;
@@ -381,35 +416,44 @@ lflow_table_sync_to_sb(struct lflow_table *lflow_table,
                              ovn_internal_version_changed,
                              sbflow, dpgrp_table);
 
-            hmap_remove(lflows, &lflow->hmap_node);
-            hmap_insert(&lflows_temp, &lflow->hmap_node,
-                        hmap_node_hash(&lflow->hmap_node));
+            size_t hash = swtab_node_hash(&lflow->swtab_node);
+            swtab_remove(&shard->entries, &lflow->swtab_node);
+            swtab_insert(&lflows_temp[lflow_table_shard_idx(hash)],
+                         &lflow->swtab_node, hash);
         } else {
             sbrec_logical_flow_delete(sbflow);
         }
     }
 
-    HMAP_FOR_EACH_SAFE (lflow, hmap_node, lflows) {
-        if (search_mode != LFLOW_TABLE_SEARCH_FIELDS) {
-            break;
-        }
-        const struct ovn_synced_datapaths *datapaths;
-        struct hmap *dp_groups;
-        enum ovn_datapath_type dp_type =
-            ovn_stage_to_datapath_type(lflow->stage);
-        dp_groups = &lflow_table->dp_groups[dp_type];
-        datapaths = &dps[dp_type];
-        sync_lflow_to_sb(lflow, ovnsb_txn, dp_groups, datapaths,
-                         ovn_internal_version_changed, NULL, dpgrp_table);
+    if (search_mode == LFLOW_TABLE_SEARCH_FIELDS) {
+        for (size_t i = 0; i < LFLOW_TABLE_N_SHARDS; i++) {
+            struct swtab *lflows = &lflow_table->shards[i].entries;
 
-        hmap_remove(lflows, &lflow->hmap_node);
-        hmap_insert(&lflows_temp, &lflow->hmap_node,
-                    hmap_node_hash(&lflow->hmap_node));
+            SWTAB_FOR_EACH_SAFE (lflow, swtab_node, lflows) {
+                const struct ovn_synced_datapaths *datapaths;
+                struct hmap *dp_groups;
+                enum ovn_datapath_type dp_type =
+                    ovn_stage_to_datapath_type(lflow->stage);
+                dp_groups = &lflow_table->dp_groups[dp_type];
+                datapaths = &dps[dp_type];
+                sync_lflow_to_sb(lflow, ovnsb_txn, dp_groups, datapaths,
+                                 ovn_internal_version_changed, NULL,
+                                 dpgrp_table);
+
+                size_t hash = swtab_node_hash(&lflow->swtab_node);
+                swtab_remove(lflows, &lflow->swtab_node);
+                swtab_insert(&lflows_temp[lflow_table_shard_idx(hash)],
+                             &lflow->swtab_node, hash);
+            }
+        }
     }
+
     search_mode = LFLOW_TABLE_SEARCH_SBUUID;
     uuidset_destroy(&sb_uuid_set);
-    hmap_swap(lflows, &lflows_temp);
-    hmap_destroy(&lflows_temp);
+    for (size_t i = 0; i < LFLOW_TABLE_N_SHARDS; i++) {
+        swtab_swap(&lflow_table->shards[i].entries, &lflows_temp[i]);
+        swtab_destroy(&lflows_temp[i]);
+    }
 }
 
 /* Logical flow sync using 'struct lflow_ref'
@@ -578,9 +622,9 @@ lflow_table_sync_to_sb(struct lflow_table *lflow_table,
  *
  * One way to ensure thread safety is to maintain array of hash locks
  * in each lflow_ref just like how we have static variable lflow_hash_locks
- * of type ovs_mutex. This would mean that client has to reconsile the
+ * of type ovs_mutex. This would mean that client has to reconcile the
  * lflow_ref hmap lflow_ref_nodes (by calling hmap_expand()) after the
- * lflow generation is complete.  (See lflow_table_expand()).
+ * lflow generation is complete.
  *
  * Presently the client of lflow manager (northd.c) doesn't call
  * lflow_table_add_lflow() in multiple threads for the same lflow_ref.
@@ -756,7 +800,7 @@ lflow_table_add_lflow__(struct lflow_table *lflow_table,
                                  priority, match,
                                  actions, acl_ct_translation);
 
-    hash_lock = lflow_hash_lock(&lflow_table->entries, hash);
+    hash_lock = lflow_hash_lock(lflow_table, hash);
     struct ovn_lflow *lflow =
         do_ovn_lflow_add(lflow_table,
                          sdp ? sparse_array_len(&sdp->dps->dps_array)
@@ -916,22 +960,12 @@ ovn_dp_groups_destroy(struct hmap *dp_groups)
 void
 lflow_hash_lock_init(void)
 {
-    if (!lflow_hash_lock_initialized) {
-        for (size_t i = 0; i < LFLOW_HASH_LOCK_MASK + 1; i++) {
-            ovs_mutex_init(&lflow_hash_locks[i]);
-        }
-        lflow_hash_lock_initialized = true;
-    }
+    lflow_hash_lock_initialized = true;
 }
 
 void
 lflow_hash_lock_destroy(void)
 {
-    if (lflow_hash_lock_initialized) {
-        for (size_t i = 0; i < LFLOW_HASH_LOCK_MASK + 1; i++) {
-            ovs_mutex_destroy(&lflow_hash_locks[i]);
-        }
-    }
     lflow_hash_lock_initialized = false;
 }
 
@@ -964,15 +998,15 @@ ovn_lflow_init(struct ovn_lflow *lflow,
 }
 
 static struct ovs_mutex *
-lflow_hash_lock(const struct hmap *lflow_table, uint32_t hash)
+lflow_hash_lock(struct lflow_table *lflow_table, uint32_t hash)
     OVS_ACQUIRES(fake_hash_mutex)
     OVS_NO_THREAD_SAFETY_ANALYSIS
 {
     struct ovs_mutex *hash_lock = NULL;
 
     if (parallelization_state == STATE_USE_PARALLELIZATION) {
-        hash_lock =
-            &lflow_hash_locks[hash & lflow_table->mask & LFLOW_HASH_LOCK_MASK];
+        ovs_assert(lflow_hash_lock_initialized);
+        hash_lock = &lflow_table_shard_for_hash(lflow_table, hash)->mutex;
         ovs_mutex_lock(hash_lock);
     }
     return hash_lock;
@@ -1003,14 +1037,14 @@ ovn_lflow_equal(const struct ovn_lflow *a, const struct ovn_stage *stage,
 }
 
 static struct ovn_lflow *
-ovn_lflow_find(const struct hmap *lflows,
+ovn_lflow_find(const struct swtab *lflows,
                const struct ovn_stage *stage, uint16_t priority,
                const char *match, const char *actions,
                const char *ctrl_meter, bool acl_ct_translation,
                uint32_t hash)
 {
     struct ovn_lflow *lflow;
-    HMAP_FOR_EACH_WITH_HASH (lflow, hmap_node, hash, lflows) {
+    SWTAB_FOR_EACH_WITH_HASH (lflow, swtab_node, hash, lflows) {
         if (ovn_lflow_equal(lflow, stage, priority, match, actions,
                             ctrl_meter, acl_ct_translation)) {
             return lflow;
@@ -1031,7 +1065,7 @@ ovn_lflow_hint(const struct ovsdb_idl_row *row)
 static void
 ovn_lflow_destroy(struct lflow_table *lflow_table, struct ovn_lflow *lflow)
 {
-    hmap_remove(&lflow_table->entries, &lflow->hmap_node);
+    lflow_table_remove(lflow_table, lflow);
     dynamic_bitmap_free(&lflow->dpg_bitmap);
     free(lflow->match);
     free(lflow->actions);
@@ -1062,9 +1096,9 @@ do_ovn_lflow_add(struct lflow_table *lflow_table, size_t dp_bitmap_len,
 
     ovs_assert(dp_bitmap_len);
 
-    old_lflow = ovn_lflow_find(&lflow_table->entries, stage,
-                               priority, match, actions, ctrl_meter,
-                               acl_ct_translation, hash);
+    old_lflow = ovn_lflow_find(
+        &lflow_table_shard_for_hash(lflow_table, hash)->entries, stage,
+        priority, match, actions, ctrl_meter, acl_ct_translation, hash);
     if (old_lflow) {
         dynamic_bitmap_realloc(&old_lflow->dpg_bitmap, dp_bitmap_len);
         if (old_lflow->sync_state != LFLOW_STALE) {
@@ -1086,15 +1120,7 @@ do_ovn_lflow_add(struct lflow_table *lflow_table, size_t dp_bitmap_len,
                    acl_ct_translation, where,
                    flow_desc, sbuuid);
 
-    if (parallelization_state != STATE_USE_PARALLELIZATION) {
-        hmap_insert(&lflow_table->entries, &lflow->hmap_node, hash);
-    } else {
-        hmap_insert_fast(&lflow_table->entries, &lflow->hmap_node,
-                         hash);
-        if (uuid_is_zero(&lflow->sb_uuid)) {
-            thread_lflow_counter++;
-        }
-    }
+    lflow_table_insert(lflow_table, lflow, hash);
 
     return lflow;
 }
