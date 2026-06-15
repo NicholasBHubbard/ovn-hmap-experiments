@@ -62,17 +62,82 @@ struct hmap {
     struct hmap_node *one;
     size_t mask;
     size_t n;
+#ifdef HMAP_STATS
+    struct hmap_stats *stats;
+#endif
 };
 
 /* Initializer for an empty hash map. */
+#ifdef HMAP_STATS
+#define HMAP_INITIALIZER(HMAP) \
+    { (struct hmap_node **const) &(HMAP)->one, NULL, 0, 0, NULL }
+#else
 #define HMAP_INITIALIZER(HMAP) \
     { (struct hmap_node **const) &(HMAP)->one, NULL, 0, 0 }
+#endif
 
 /* Initializer for an immutable struct hmap 'HMAP' that contains 'N' nodes
  * linked together starting at 'NODE'.  The hmap only has a single chain of
  * hmap_nodes, so 'N' should be small. */
+#ifdef HMAP_STATS
+#define HMAP_CONST(HMAP, N, NODE) {                                 \
+        CONST_CAST(struct hmap_node **, &(HMAP)->one), NODE, 0, N, NULL }
+#else
 #define HMAP_CONST(HMAP, N, NODE) {                                 \
         CONST_CAST(struct hmap_node **, &(HMAP)->one), NODE, 0, N }
+#endif
+
+#ifdef HMAP_STATS
+void hmap_stats_init(struct hmap *, const char *where);
+void hmap_stats_destroy(struct hmap *, const char *where);
+void hmap_stats_clear(struct hmap *, size_t n, const char *where);
+void hmap_stats_swap(struct hmap *, struct hmap *, const char *where);
+void hmap_stats_moved(struct hmap *, const char *where);
+void hmap_stats_resize(struct hmap *, const char *where);
+void hmap_stats_reserve(struct hmap *, size_t capacity, const char *where);
+void hmap_stats_insert(struct hmap *, bool fast, const char *where);
+void hmap_stats_remove(struct hmap *, const char *where);
+void hmap_stats_replace(struct hmap *, const char *where);
+void hmap_stats_search_hash(const struct hmap *, size_t hash,
+                            bool found, const char *where);
+void hmap_stats_search_bucket(const struct hmap *, size_t hash,
+                              bool found, const char *where);
+void hmap_stats_iter_first(const struct hmap *, bool found,
+                           const char *where);
+void hmap_stats_iter_next(const struct hmap *, bool found,
+                          const char *where);
+#else
+#define hmap_stats_init(HMAP, WHERE) \
+    ((void) sizeof(HMAP), (void) sizeof(WHERE))
+#define hmap_stats_destroy(HMAP, WHERE) \
+    ((void) sizeof(HMAP), (void) sizeof(WHERE))
+#define hmap_stats_clear(HMAP, N, WHERE) \
+    ((void) sizeof(HMAP), (void) sizeof(N), (void) sizeof(WHERE))
+#define hmap_stats_swap(A, B, WHERE) \
+    ((void) sizeof(A), (void) sizeof(B), (void) sizeof(WHERE))
+#define hmap_stats_moved(HMAP, WHERE) \
+    ((void) sizeof(HMAP), (void) sizeof(WHERE))
+#define hmap_stats_resize(HMAP, WHERE) \
+    ((void) sizeof(HMAP), (void) sizeof(WHERE))
+#define hmap_stats_reserve(HMAP, CAPACITY, WHERE) \
+    ((void) sizeof(HMAP), (void) sizeof(CAPACITY), (void) sizeof(WHERE))
+#define hmap_stats_insert(HMAP, FAST, WHERE) \
+    ((void) sizeof(HMAP), (void) sizeof(FAST), (void) sizeof(WHERE))
+#define hmap_stats_remove(HMAP, WHERE) \
+    ((void) sizeof(HMAP), (void) sizeof(WHERE))
+#define hmap_stats_replace(HMAP, WHERE) \
+    ((void) sizeof(HMAP), (void) sizeof(WHERE))
+#define hmap_stats_search_hash(HMAP, HASH, FOUND, WHERE) \
+    ((void) sizeof(HMAP), (void) sizeof(HASH), (void) sizeof(FOUND), \
+     (void) sizeof(WHERE))
+#define hmap_stats_search_bucket(HMAP, HASH, FOUND, WHERE) \
+    ((void) sizeof(HMAP), (void) sizeof(HASH), (void) sizeof(FOUND), \
+     (void) sizeof(WHERE))
+#define hmap_stats_iter_first(HMAP, FOUND, WHERE) \
+    ((void) sizeof(HMAP), (void) sizeof(FOUND), (void) sizeof(WHERE))
+#define hmap_stats_iter_next(HMAP, FOUND, WHERE) \
+    ((void) sizeof(HMAP), (void) sizeof(FOUND), (void) sizeof(WHERE))
+#endif
 
 /* Initialization. */
 void hmap_init(struct hmap *);
@@ -100,9 +165,15 @@ static inline void hmap_insert_at(struct hmap *, struct hmap_node *,
 #define hmap_insert(HMAP, NODE, HASH) \
     hmap_insert_at(HMAP, NODE, HASH, OVS_SOURCE_LOCATOR)
 
-static inline void hmap_insert_fast(struct hmap *,
-                                    struct hmap_node *, size_t hash);
-static inline void hmap_remove(struct hmap *, struct hmap_node *);
+static inline void hmap_insert_fast_at(struct hmap *,
+                                       struct hmap_node *, size_t hash,
+                                       const char *where);
+#define hmap_insert_fast(HMAP, NODE, HASH) \
+    hmap_insert_fast_at(HMAP, NODE, HASH, OVS_SOURCE_LOCATOR)
+static inline void hmap_remove_at(struct hmap *, struct hmap_node *,
+                                  const char *where);
+#define hmap_remove(HMAP, NODE) \
+    hmap_remove_at(HMAP, NODE, OVS_SOURCE_LOCATOR)
 
 void hmap_node_moved(struct hmap *, struct hmap_node *, struct hmap_node *);
 static inline void hmap_replace(struct hmap *, const struct hmap_node *old,
@@ -146,11 +217,17 @@ struct hmap_node *hmap_random_node(const struct hmap *);
          CONDITION_MULTIVAR(NODE, MEMBER, ITER_VAR(NODE) != NULL);            \
          UPDATE_MULTIVAR(NODE, hmap_next_in_bucket(ITER_VAR(NODE))))
 
-static inline struct hmap_node *hmap_first_with_hash(const struct hmap *,
-                                                     size_t hash);
+static inline struct hmap_node *hmap_first_with_hash_at(const struct hmap *,
+                                                        size_t hash,
+                                                        const char *where);
+#define hmap_first_with_hash(HMAP, HASH) \
+    hmap_first_with_hash_at(HMAP, HASH, OVS_SOURCE_LOCATOR)
 static inline struct hmap_node *hmap_next_with_hash(const struct hmap_node *);
-static inline struct hmap_node *hmap_first_in_bucket(const struct hmap *,
-                                                     size_t hash);
+static inline struct hmap_node *hmap_first_in_bucket_at(const struct hmap *,
+                                                        size_t hash,
+                                                        const char *where);
+#define hmap_first_in_bucket(HMAP, HASH) \
+    hmap_first_in_bucket_at(HMAP, HASH, OVS_SOURCE_LOCATOR)
 static inline struct hmap_node *hmap_next_in_bucket(const struct hmap_node *);
 
 bool hmap_contains(const struct hmap *, const struct hmap_node *);
@@ -245,9 +322,13 @@ hmap_pop_helper__(struct hmap *hmap, struct hmap_pop_helper_iter__ *iter) {
                                          NODE, MEMBER)),1):                   \
             (((NODE) = NULL), 0);)
 
-static inline struct hmap_node *hmap_first(const struct hmap *);
-static inline struct hmap_node *hmap_next(const struct hmap *,
-                                          const struct hmap_node *);
+static inline struct hmap_node *hmap_first_at(const struct hmap *,
+                                              const char *where);
+#define hmap_first(HMAP) hmap_first_at(HMAP, OVS_SOURCE_LOCATOR)
+static inline struct hmap_node *hmap_next_at(const struct hmap *,
+                                             const struct hmap_node *,
+                                             const char *where);
+#define hmap_next(HMAP, NODE) hmap_next_at(HMAP, NODE, OVS_SOURCE_LOCATOR)
 
 struct hmap_position {
     unsigned int bucket;
@@ -285,13 +366,21 @@ hmap_is_empty(const struct hmap *hmap)
 /* Inserts 'node', with the given 'hash', into 'hmap'.  'hmap' is never
  * expanded automatically. */
 static inline void
-hmap_insert_fast(struct hmap *hmap, struct hmap_node *node, size_t hash)
+hmap_insert_fast_raw__(struct hmap *hmap, struct hmap_node *node, size_t hash)
 {
     struct hmap_node **bucket = &hmap->buckets[hash & hmap->mask];
     node->hash = hash;
     node->next = *bucket;
     *bucket = node;
     hmap->n++;
+}
+
+static inline void
+hmap_insert_fast_at(struct hmap *hmap, struct hmap_node *node, size_t hash,
+                    const char *where)
+{
+    hmap_insert_fast_raw__(hmap, node, hash);
+    hmap_stats_insert(hmap, true, where);
 }
 
 /* Inserts 'node', with the given 'hash', into 'hmap', and expands 'hmap' if
@@ -304,7 +393,8 @@ static inline void
 hmap_insert_at(struct hmap *hmap, struct hmap_node *node, size_t hash,
                const char *where)
 {
-    hmap_insert_fast(hmap, node, hash);
+    hmap_insert_fast_raw__(hmap, node, hash);
+    hmap_stats_insert(hmap, false, where);
     if (hmap->n / 2 > hmap->mask) {
         hmap_expand_at(hmap, where);
     }
@@ -313,7 +403,7 @@ hmap_insert_at(struct hmap *hmap, struct hmap_node *node, size_t hash,
 /* Removes 'node' from 'hmap'.  Does not shrink the hash table; call
  * hmap_shrink() directly if desired. */
 static inline void
-hmap_remove(struct hmap *hmap, struct hmap_node *node)
+hmap_remove_at(struct hmap *hmap, struct hmap_node *node, const char *where)
 {
     struct hmap_node **bucket = &hmap->buckets[node->hash & hmap->mask];
     while (*bucket != node) {
@@ -321,6 +411,7 @@ hmap_remove(struct hmap *hmap, struct hmap_node *node)
     }
     *bucket = node->next;
     hmap->n--;
+    hmap_stats_remove(hmap, where);
 }
 
 /* Puts 'new_node' in the position in 'hmap' currently occupied by 'old_node'.
@@ -341,6 +432,7 @@ hmap_replace(struct hmap *hmap,
     *bucket = new_node;
     new_node->hash = old_node->hash;
     new_node->next = old_node->next;
+    hmap_stats_replace(hmap, OVS_SOURCE_LOCATOR);
 }
 
 static inline struct hmap_node *
@@ -355,17 +447,24 @@ hmap_next_with_hash__(const struct hmap_node *node, size_t hash)
 /* Returns the first node in 'hmap' with the given 'hash', or a null pointer if
  * no nodes have that hash value. */
 static inline struct hmap_node *
-hmap_first_with_hash(const struct hmap *hmap, size_t hash)
+hmap_first_with_hash_at(const struct hmap *hmap, size_t hash,
+                        const char *where)
 {
-    return hmap_next_with_hash__(hmap->buckets[hash & hmap->mask], hash);
+    struct hmap_node *node =
+        hmap_next_with_hash__(hmap->buckets[hash & hmap->mask], hash);
+    hmap_stats_search_hash(hmap, hash, node != NULL, where);
+    return node;
 }
 
 /* Returns the first node in 'hmap' in the bucket in which the given 'hash'
  * would land, or a null pointer if that bucket is empty. */
 static inline struct hmap_node *
-hmap_first_in_bucket(const struct hmap *hmap, size_t hash)
+hmap_first_in_bucket_at(const struct hmap *hmap, size_t hash,
+                        const char *where)
 {
-    return hmap->buckets[hash & hmap->mask];
+    struct hmap_node *node = hmap->buckets[hash & hmap->mask];
+    hmap_stats_search_bucket(hmap, hash, node != NULL, where);
+    return node;
 }
 
 /* Returns the next node in the same bucket as 'node', or a null pointer if
@@ -412,9 +511,11 @@ hmap_next__(const struct hmap *hmap, size_t start)
 /* Returns the first node in 'hmap', in arbitrary order, or a null pointer if
  * 'hmap' is empty. */
 static inline struct hmap_node *
-hmap_first(const struct hmap *hmap)
+hmap_first_at(const struct hmap *hmap, const char *where)
 {
-    return hmap_next__(hmap, 0);
+    struct hmap_node *node = hmap_next__(hmap, 0);
+    hmap_stats_iter_first(hmap, node != NULL, where);
+    return node;
 }
 
 /* Returns the next node in 'hmap' following 'node', in arbitrary order, or a
@@ -425,11 +526,15 @@ hmap_first(const struct hmap *hmap)
  * not prevent calling this function, since node->next is preserved, although
  * freeing 'node' of course does.) */
 static inline struct hmap_node *
-hmap_next(const struct hmap *hmap, const struct hmap_node *node)
+hmap_next_at(const struct hmap *hmap, const struct hmap_node *node,
+             const char *where)
 {
-    return (node->next
-            ? node->next
-            : hmap_next__(hmap, (node->hash & hmap->mask) + 1));
+    struct hmap_node *next =
+        (node->next
+         ? node->next
+         : hmap_next__(hmap, (node->hash & hmap->mask) + 1));
+    hmap_stats_iter_next(hmap, next != NULL, where);
+    return next;
 }
 
 #ifdef  __cplusplus
