@@ -39,6 +39,7 @@ openvswitchinclude_HEADERS = \
 	include/openvswitch/poll-loop.h \
 	include/openvswitch/rconn.h \
 	include/openvswitch/shash.h \
+	include/openvswitch/swtab.h \
 	include/openvswitch/thread.h \
 	include/openvswitch/token-bucket.h \
 	include/openvswitch/tun-metadata.h \
